@@ -19,9 +19,17 @@ const { spawn } = require('child_process');
 
 const FILES = [
   { label: 'unit', file: 'unit.test.js', what: 'pure logic — stability, candidates, scoring' },
+  { label: 'targets', file: 'targets.test.js', what: 'typed application URLs and their saved logins' },
   { label: 'fingerprint', file: 'fingerprint.test.js', what: 'Chromium — extraction and replay against the fixtures' },
   { label: 'positional', file: 'positional.test.js', what: 'Chromium — the DOM-index / relative-XPath / absolute-XPath fallbacks' },
   { label: 'e2e', file: 'e2e-fixture.test.js', what: 'Chromium — record then replay, end to end, through the public API' },
+  { label: 'replay', file: 'replay.test.js', what: 'Chromium + sample app - cross-env replay, verdicts, cancel, redaction, protected guard' },
+  { label: 'security', file: 'security.test.js', what: 'OS credential store, migration, no plaintext fallback, session encryption, ACLs' },
+  { label: 'safety', file: 'safety.test.js', what: 'Chromium - SSRF guard: redirects, metadata, private ranges, DNS, websockets' },
+  { label: 'auth', file: 'auth.test.js', what: 'Chromium + mock Keycloak - login, failure, MFA, expiry, env isolation' },
+  { label: 'reliability', file: 'reliability.test.js', what: 'Chromium - launch failure, crash, cancel, shutdown, concurrency, orphans' },
+  { label: 'compat', file: 'compat.test.js', what: 'Chromium - private Playwright recorder API canary' },
+  { label: 'lifecycle', file: 'recording-lifecycle.test.js', what: 'Chromium - machine-driven real recording lifecycle and cleanup' },
 ];
 
 /** Run one test file, echoing its output live, and read the summary line back out of it. */
@@ -46,7 +54,8 @@ function runFile(entry) {
       // Two summary shapes are accepted: the labelled one the harness prints
       // ("fingerprint: 45 passed, 0 failed, 45 total") and the bare one
       // ("11 passed, 0 failed, 11 total"), which e2e-fixture.test.js uses.
-      const m = buffer.match(/^\s*(?:[\w-]+:\s+)?(\d+) passed,\s+(\d+) failed,\s+(\d+) total/m);
+      // A label may contain spaces or brackets: "auth (mock Keycloak): 15 passed, …".
+      const m = buffer.match(/^\s*(?:[^\n:]+:\s+)?(\d+) passed,\s+(\d+) failed,\s+(\d+) total/m);
       resolve({
         ...entry,
         code: code == null ? 1 : code,
@@ -78,7 +87,7 @@ function runFile(entry) {
   const known = results.reduce((a, r) => a + r.knownBugs, 0);
 
   const line = '═'.repeat(66);
-  process.stdout.write(`\n${line}\n  ELEMENT IDENTITY ENGINE — combined summary\n${line}\n`);
+  process.stdout.write(`\n${line}\n  REPLAYR — combined test summary\n${line}\n`);
   for (const r of results) {
     const verdict = r.parsed ? `${String(r.passed).padStart(3)} passed  ${String(r.failed).padStart(2)} failed` : '  DID NOT REPORT A SUMMARY';
     process.stdout.write(`  ${r.label.padEnd(12)} ${verdict}   ${String(r.ms).padStart(5)}ms   ${r.what}\n`);

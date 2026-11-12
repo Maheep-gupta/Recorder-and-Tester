@@ -1,21 +1,25 @@
 /**
- * Design Studio Tester — storage.
+ * Replayr — storage.
  *
  * Tests are JSON files, one per test, in the launcher's `local-tests/` folder. Run evidence goes to
  * `local-tests/runs/<test-id>/<run-id>/` (result.json, screenshot, console log). No database: a
  * developer can read, diff, copy and hand-write everything here.
  *
  * Test file shape:
- *   { id, name, description, target: { app }, settings: { stepTimeoutMs? }, createdAt, updatedAt,
+ *   { id, name, description, target: { app }, settings: { stepTimeoutMs? }, schemaVersion: 2,
+ *     bug?: { expected, actual, severity }, createdAt, updatedAt,
  *     tags: [...], folder: null, favorite: false,
  *     steps: [...], lastRun: { runId, status, failedStep?, at, durationMs } }
  */
 'use strict';
 
 const fs = require('fs');
+const { renameSyncRetry } = require('./fsutil');
 const path = require('path');
 const config = require('./config');
 const steps = require('./steps');
+const urlsafety = require('./urlsafety');
+const targets = require('./targets');
 
 const TESTS = config.testsDir;
 const RUNS = path.join(TESTS, 'runs');
@@ -57,7 +61,7 @@ function writeJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
-  fs.renameSync(tmp, file);
+  renameSyncRetry(tmp, file);
 }
 
 // ────────────────────────────────────────────────────────────── tests
@@ -66,7 +70,7 @@ function list() {
   ensureDirs();
   const out = [];
   for (const f of fs.readdirSync(TESTS)) {
-    if (!f.endsWith('.json')) continue;
+    if (!isTestFileName(f)) continue;
     try {
       const t = readJson(path.join(TESTS, f));
       out.push(summary(t));
@@ -83,7 +87,30 @@ function summary(t) {
     id: t.id, name: t.name, description: t.description || '', target: t.target,
     stepCount: (t.steps || []).length, createdAt: t.createdAt, updatedAt: t.updatedAt, lastRun: t.lastRun || null,
     tags: t.tags || [], folder: t.folder || null, favorite: !!t.favorite,
+    bug: t.bug || null,
   };
+}
+
+const SEVERITIES = ['low', 'medium', 'high', 'critical'];
+
+/**
+ * Optional bug metadata: { expected, actual, severity }. Strings are trimmed and capped at 2000
+ * characters; severity must be one of SEVERITIES. Nothing meaningful => null.
+ */
+function normaliseBug(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) throw httpError(400, 'bug must be an object');
+  const text = (v, what) => {
+    if (v === undefined || v === null) return '';
+    if (typeof v !== 'string') throw httpError(400, `bug.${what} must be a string`);
+    return v.trim().slice(0, 2000);
+  };
+  const bug = { expected: text(value.expected, 'expected'), actual: text(value.actual, 'actual') };
+  if (value.severity !== undefined && value.severity !== null && value.severity !== '') {
+    if (!SEVERITIES.includes(value.severity)) throw httpError(400, `bug.severity must be one of ${SEVERITIES.join(', ')}`);
+    bug.severity = value.severity;
+  }
+  return bug.expected || bug.actual || bug.severity ? bug : null;
 }
 
 /** Tags are a tidy little set: trimmed, no blanks, no duplicates, at most 20 × 40 characters. */
@@ -110,16 +137,54 @@ function normaliseFolder(value) {
 
 function load(id) {
   const file = testFile(id);
-  if (!fs.existsSync(file)) throw httpError(404, `No test "${id}"`);
+  if (RESERVED_IDS.has(String(id)) || !fs.existsSync(file)) throw httpError(404, `No test "${id}"`);
   return readJson(file);
 }
 
+/**
+ * Files in the tests folder that are NOT tests: the environments store and the recorder's draft
+ * (a dot-file). An id that would land on one of them is treated as taken, so a test named
+ * "Environments" becomes `environments-2` instead of overwriting the store.
+ */
+const RESERVED_IDS = new Set(['environments']);
+function isTestFileName(f) {
+  if (!f.endsWith('.json') || f.startsWith('.')) return false;
+  return !RESERVED_IDS.has(f.slice(0, -'.json'.length));
+}
 function exists(id) {
-  return fs.existsSync(testFile(id));
+  return RESERVED_IDS.has(String(id)) || fs.existsSync(testFile(id));
 }
 
 /** Create from a draft. Picks a unique id from the name. */
-function create({ name, description, target, steps: draftSteps, settings, tags, folder, favorite }) {
+/**
+ * The `target.app` to store. A URL (bare or `url:`) is validated and canonicalised — one that
+ * matches a configured app becomes that app's key. An unrecognised plain key is kept as-is, so a
+ * test imported from a machine with other apps configured still saves; it fails at run time with
+ * "Unknown app" instead.
+ */
+function targetKey(app) {
+  let def;
+  try { def = targets.resolve(app); } catch (e) { throw httpError(400, e.message); }
+  return def ? def.key : String(app);
+}
+
+/**
+ * A step marked `secret` never keeps its typed value on disk. Replay never types a secret value
+ * (it fills ''), so the plaintext has no use — keeping it would only leak it into the JSON, an
+ * export, or a backup. The recorder already blanks it; this is the second line of defence for
+ * imports, hand-edits and API callers.
+ */
+function scrubSecrets(list) {
+  return (list || []).map((s) => {
+    if (!s || s.secret !== true) return s;
+    const out = { ...s };
+    if (out.value !== undefined) out.value = '';
+    if (out.values !== undefined) out.values = [];
+    return out;
+  });
+}
+
+function create({ name, description, target, steps: draftSteps, settings, tags, folder, favorite, bug }) {
   ensureDirs();
   if (!name || !String(name).trim()) throw httpError(400, 'A test needs a name');
   const problems = steps.validateSteps(draftSteps);
@@ -131,16 +196,19 @@ function create({ name, description, target, steps: draftSteps, settings, tags, 
     id,
     name: String(name).trim(),
     description: description || '',
-    target: { app: (target && target.app) || config.defaultApp },
+    target: { app: targetKey((target && target.app) || config.defaultApp) },
     settings: settings || {},
     tags: normaliseTags(tags),
     folder: normaliseFolder(folder),
     favorite: !!favorite,
+    schemaVersion: 2,
     createdAt: now,
     updatedAt: now,
-    steps: renumber(draftSteps),
+    steps: renumber(scrubSecrets(draftSteps)),
     lastRun: null,
   };
+  const bugMeta = normaliseBug(bug);
+  if (bugMeta) test.bug = bugMeta;
   writeJson(testFile(id), test);
   return test;
 }
@@ -154,15 +222,20 @@ function update(id, patch) {
   }
   if (patch.description !== undefined) test.description = patch.description || '';
   if (patch.settings !== undefined) test.settings = patch.settings || {};
-  if (patch.target && patch.target.app) test.target = { app: patch.target.app };
+  if (patch.target && patch.target.app) test.target = { app: targetKey(patch.target.app) };
   if (patch.tags !== undefined) test.tags = normaliseTags(patch.tags);
   if (patch.folder !== undefined) test.folder = normaliseFolder(patch.folder);
   if (patch.favorite !== undefined) test.favorite = !!patch.favorite;
+  if (patch.bug !== undefined) {
+    const bugMeta = normaliseBug(patch.bug);
+    if (bugMeta) test.bug = bugMeta; else delete test.bug;
+  }
   if (patch.steps !== undefined) {
     const problems = steps.validateSteps(patch.steps);
     if (problems.length) throw httpError(400, problems.join('; '));
-    test.steps = renumber(patch.steps);
+    test.steps = renumber(scrubSecrets(patch.steps));
   }
+  test.schemaVersion = 2;
   test.updatedAt = new Date().toISOString();
   writeJson(testFile(id), test);
   return test;
@@ -182,6 +255,7 @@ function duplicate(id) {
     tags: original.tags || [],
     folder: original.folder || null,
     favorite: !!original.favorite,
+    schemaVersion: 2,
     createdAt: now,
     updatedAt: now,
     steps: (original.steps || []).map((s) => ({ ...s })),
@@ -201,6 +275,19 @@ function importTest(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw httpError(400, 'An import needs a test object');
   if (!obj.name || !String(obj.name).trim()) throw httpError(400, 'The imported test has no name');
   if (!Array.isArray(obj.steps)) throw httpError(400, 'The imported test has no "steps" array');
+  // An imported test is untrusted: its absolute URLs must be ordinary web addresses, never a
+  // cloud metadata service. (Non-http schemes are already refused by steps.validateSteps.)
+  obj.steps.forEach((st, i) => {
+    for (const field of ['url', 'at']) {
+      const v = st && st[field];
+      if (typeof v !== 'string' || !v || v.startsWith('{{baseUrl}}')) continue;
+      let host = null;
+      try { host = new URL(v).hostname; } catch (e) { continue; }   // validateSteps reports bad URLs
+      if (urlsafety.classifyHost(host) === 'metadata') {
+        throw httpError(400, `Step ${i + 1}: ${host} is a cloud metadata service address and cannot be imported`);
+      }
+    }
+  });
   return create({
     name: obj.name,
     description: obj.description,
@@ -210,7 +297,27 @@ function importTest(obj) {
     tags: obj.tags,
     folder: obj.folder,
     favorite: obj.favorite,
+    bug: obj.bug,
   });
+}
+
+/**
+ * The raw stored test for download. Anything a recorder marked `secret` loses its value, and no
+ * credentials ever live in a test, so what is left is safe to hand to another machine.
+ */
+function exportable(id) {
+  const test = load(id);
+  const mask = (u) => (typeof u === 'string' ? steps.maskSecretQuery(u) : u);
+  test.steps = (test.steps || []).map((s) => {
+    if (!s) return s;
+    // Tests recorded before URL masking existed may still carry a live token in a query string.
+    let out = { ...s };
+    if (out.url !== undefined) out.url = mask(out.url);
+    if (out.at !== undefined) out.at = mask(out.at);
+    if (out.secret === true) { const { value, values, ...rest } = out; out = rest; }
+    return out;
+  });
+  return test;
 }
 
 /** How the whole shelf of tests stands. `running` is the server's to fill: only it knows. */
@@ -243,7 +350,7 @@ function remove(id) {
   // Deleting something that is not there is a mistake worth reporting, not a quiet success: the
   // page would otherwise show "deleted" for a stale row or a mistyped id and the developer would
   // believe it.
-  if (!fs.existsSync(file)) throw httpError(404, `No test "${id}"`);
+  if (RESERVED_IDS.has(String(id)) || !fs.existsSync(file)) throw httpError(404, `No test "${id}"`);
   fs.mkdirSync(TRASH, { recursive: true });
   const stamp = trashStamp(new Date());
   try {
@@ -321,7 +428,7 @@ function restoreFromTrash(file) {
   const restored = create({
     name: test.name, description: test.description, target: test.target,
     settings: test.settings, steps: test.steps,
-    tags: test.tags, folder: test.folder, favorite: test.favorite,
+    tags: test.tags, folder: test.folder, favorite: test.favorite, bug: test.bug,
   });
   fs.unlinkSync(src);
   return restored;
@@ -350,18 +457,79 @@ function safeRunId(runId) {
   return s;
 }
 
+/** What a test's `lastRun` stamp says about a finished run. */
+function lastRunStamp(result) {
+  const stamp = {
+    runId: result.id, status: result.status, failedStep: result.failedStep || null,
+    at: result.finishedAt, durationMs: result.durationMs,
+  };
+  if (result.reason) stamp.reason = result.reason;
+  if (result.summary) stamp.summary = result.summary;
+  const app = (result.target && result.target.key) || result.app;
+  if (app) stamp.app = app;
+  return stamp;
+}
+
+/**
+ * Record that a run has begun: result.json with status 'running', WITHOUT touching the test's
+ * lastRun (the previous outcome stays visible until this run actually finishes).
+ */
+function writeRunStart(testId, runId, result) {
+  writeJson(path.join(runDir(testId, runId), 'result.json'), { ...result, id: result.id || runId, status: 'running' });
+}
+
 function saveRun(testId, result) {
   writeJson(path.join(runDir(testId, result.id), 'result.json'), result);
   // Stamp the test with the outcome so the list can show "Last run: FAIL at step 9".
   if (exists(testId)) {
     const test = load(testId);
-    test.lastRun = {
-      runId: result.id, status: result.status, failedStep: result.failedStep || null,
-      at: result.finishedAt, durationMs: result.durationMs,
-    };
+    test.lastRun = lastRunStamp(result);
     writeJson(testFile(testId), test);
   }
   pruneRuns(testId);
+}
+
+/**
+ * Called once at boot. A result.json still saying 'running' belongs to a process that died, so it
+ * becomes error/interrupted (finishedAt = the file's mtime) and, if the test's lastRun pointed at
+ * it, that stamp follows. Returns how many runs were fixed.
+ */
+function sweepInterruptedRuns() {
+  let fixed = 0;
+  if (!fs.existsSync(RUNS)) return 0;
+  for (const testId of fs.readdirSync(RUNS)) {
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(testId)) continue;
+    const dir = path.join(RUNS, testId);
+    let runIds;
+    try { runIds = fs.readdirSync(dir); } catch (e) { continue; }
+    for (const runId of runIds) {
+      if (!/^[0-9A-Za-z_-]+$/.test(runId)) continue;
+      const file = path.join(dir, runId, 'result.json');
+      try {
+        if (!fs.existsSync(file)) continue;
+        const result = readJson(file);
+        if (!result || result.status !== 'running') continue;
+        result.status = 'error';
+        result.reason = 'interrupted';
+        result.summary = 'The service stopped while this run was in progress.';
+        result.finishedAt = fs.statSync(file).mtime.toISOString();
+        if (result.startedAt && !Number.isFinite(result.durationMs)) {
+          const d = Date.parse(result.finishedAt) - Date.parse(result.startedAt);
+          if (Number.isFinite(d) && d >= 0) result.durationMs = d;
+        }
+        writeJson(file, result);
+        if (exists(testId)) {
+          const test = load(testId);
+          if (test.lastRun && test.lastRun.runId === (result.id || runId)) {
+            test.lastRun = lastRunStamp({ ...result, id: result.id || runId });
+            writeJson(testFile(testId), test);
+          }
+        }
+        fixed++;
+      } catch (e) { /* one unreadable run must not stop the sweep */ }
+    }
+  }
+  return fixed;
 }
 
 /**
@@ -490,6 +658,7 @@ function runFile(testId, runId, name) {
 module.exports = {
   TRASH, listTrash, restoreFromTrash,
   TESTS, RUNS, ensureDirs, slugify,
+  exportable, writeRunStart, sweepInterruptedRuns,
   list, load, exists, create, update, remove, duplicate, importTest, stats,
   newRunId, runDir, saveRun, pruneRuns, listRuns, allRuns, loadRun, runFile,
   httpError,

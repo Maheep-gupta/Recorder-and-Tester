@@ -1,8 +1,8 @@
 {
-  "name": "record-and-test",
+  "name": "replayr",
   "version": "0.1.0",
   "private": true,
-  "description": "Record a browser flow once, replay it later as a test, with screenshots and console logs when a step fails.",
+  "description": "Replayr — record a production bug once, replay it against localhost or any environment, and verify the fix.",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

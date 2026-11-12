@@ -19,3 +19,6 @@ Thumbs.db
 test-results/
 playwright-report/
 .idea/
+
+# logins typed into the Setup form, per origin
+*.local.json

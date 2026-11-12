@@ -1,5 +1,5 @@
 /**
- * Design Studio Tester — the test step model.
+ * Replayr — the test step model.
  *
  * One place that knows what a step looks like, how a recorded Playwright action becomes one, how a
  * step reads in plain English, and how a step turns back into a Playwright locator for replay.
@@ -34,11 +34,12 @@ const STEP_TYPES = [
   'navigate', 'click', 'dblclick', 'hover', 'fill', 'press', 'check', 'uncheck', 'select', 'upload',
   'openPage', 'closePage', 'wait', 'waitForXhr',
   'expectVisible', 'expectText', 'expectValue', 'expectChecked', 'expectUrl', 'expectSnapshot',
+  'expectHidden', 'expectCount',
 ];
 const TARGET_KINDS = ['role', 'label', 'placeholder', 'text', 'testid', 'alt', 'title', 'css'];
 const NEEDS_TARGET = new Set([
   'click', 'dblclick', 'hover', 'fill', 'check', 'uncheck', 'select', 'upload',
-  'expectVisible', 'expectText', 'expectValue', 'expectChecked',
+  'expectVisible', 'expectText', 'expectValue', 'expectChecked', 'expectHidden', 'expectCount',
 ]);
 
 // ────────────────────────────────────────────────────────────── urls
@@ -47,9 +48,41 @@ const NEEDS_TARGET = new Set([
 const KEYCLOAK_FRAGMENT = /#(?=.*\bstate=)(?=.*\b(code|session_state|iss)=).*$/;
 
 /** `http://localhost:4201/design?x=1#state=…` → `{{baseUrl}}/design?x=1`. Other origins stay absolute. */
+/**
+ * Query parameters whose VALUE is a credential. Matched by exact name (case-insensitive), not by
+ * substring: "sortKey" or "authorName" are ordinary parameters and must replay unchanged.
+ */
+const SECRET_QUERY_PARAMS = new Set([
+  'token', 'access_token', 'id_token', 'refresh_token', 'auth_token', 'authtoken', 'session', 'sessionid',
+  'session_id', 'sid', 'password', 'passwd', 'pwd', 'secret', 'client_secret', 'api_key', 'apikey',
+  'sig', 'signature', 'x-amz-signature', 'x-amz-credential', 'x-amz-security-token', 'otp', 'jwt',
+]);
+const REDACTED_PARAM = 'REDACTED';
+
+/** Replace credential-bearing query values so a recorded URL never stores a live token. */
+function maskSecretQuery(url) {
+  const s = String(url);
+  const q = s.indexOf('?');
+  if (q < 0) return s;
+  const hash = s.indexOf('#', q);
+  const query = s.slice(q + 1, hash < 0 ? undefined : hash);
+  let changed = false;
+  const parts = query.split('&').map((pair) => {
+    const eq = pair.indexOf('=');
+    if (eq < 0) return pair;
+    let name;
+    try { name = decodeURIComponent(pair.slice(0, eq).replace(/\+/g, ' ')); } catch (e) { name = pair.slice(0, eq); }
+    if (!SECRET_QUERY_PARAMS.has(name.toLowerCase()) || pair.slice(eq + 1) === REDACTED_PARAM) return pair;
+    changed = true;
+    return pair.slice(0, eq + 1) + REDACTED_PARAM;
+  });
+  if (!changed) return s;
+  return s.slice(0, q + 1) + parts.join('&') + (hash < 0 ? '' : s.slice(hash));
+}
+
 function templateUrl(url, baseUrl) {
   if (!url) return url;
-  let u = String(url).replace(KEYCLOAK_FRAGMENT, '');
+  let u = maskSecretQuery(String(url).replace(KEYCLOAK_FRAGMENT, ''));
   if (baseUrl && (u === baseUrl || u.startsWith(baseUrl + '/') || u.startsWith(baseUrl + '?') || u.startsWith(baseUrl + '#'))) {
     u = '{{baseUrl}}' + u.slice(baseUrl.length);
     if (u === '{{baseUrl}}') u += '/';
@@ -71,12 +104,18 @@ function isOnApp(actual, baseUrl) {
 }
 
 /** Same path, ignoring query, hash and a trailing slash. */
-function samePath(actual, expected) {
+function samePath(actual, expected, opts) {
   try {
     const a = new URL(actual);
     const e = new URL(expected);
     const norm = (p) => p.replace(/\/+$/, '') || '/';
-    return a.origin === e.origin && norm(a.pathname) === norm(e.pathname);
+    if (!(a.origin === e.origin && norm(a.pathname) === norm(e.pathname))) return false;
+    // With matchQuery the query parameters must match too, in any order.
+    if (opts && opts.matchQuery) {
+      const q = (u) => [...u.searchParams.entries()].map(([k, v]) => k + '=' + v).sort().join('&');
+      return q(a) === q(e);
+    }
+    return true;
   } catch {
     return false;
   }
@@ -378,10 +417,14 @@ function describe(step) {
     case 'wait': return `Wait ${formatDuration(step.ms)}`;
     case 'waitForXhr': return 'Wait for network';
     case 'expectVisible': return `Expect ${t()} to be visible`;
-    case 'expectText': return `Expect ${t()} to ${step.substring === false ? 'read' : 'contain'} "${step.text}"`;
+    case 'expectText':
+      if (step.regex) return `Expect ${t()} to match /${step.regex}/`;
+      return `Expect ${t()} to ${step.substring === false || step.exact ? 'read' : 'contain'} "${step.text}"`;
+    case 'expectHidden': return `Expect ${t()} to be hidden or absent`;
+    case 'expectCount': return `Expect ${step.count} match(es) of ${t()}`;
     case 'expectValue': return `Expect ${t()} to have value "${step.value}"`;
     case 'expectChecked': return `Expect ${t()} to be ${step.checked === false ? 'unticked' : 'ticked'}`;
-    case 'expectUrl': return `Expect the URL to be ${step.url}`;
+    case 'expectUrl': return `Expect the URL to be ${step.url}${step.matchQuery ? ' (including the query)' : ''}`;
     case 'expectSnapshot': return `Expect ${t()} to match the recorded snapshot`;
     default: return `${step.type}`;
   }
@@ -469,7 +512,14 @@ function validateSteps(steps) {
     if (s.type === 'wait' && !isDuration(s.ms)) problems.push(`${where}: needs a duration in milliseconds`);
     if (s.type === 'waitForXhr' && s.timeoutMs != null && !isDuration(s.timeoutMs)) problems.push(`${where}: timeoutMs must be a number of milliseconds`);
     if (s.type === 'select' && !Array.isArray(s.values)) problems.push(`${where}: needs values`);
-    if (s.type === 'expectText' && typeof s.text !== 'string') problems.push(`${where}: needs text`);
+    if (s.type === 'expectText') {
+      if (s.regex != null && s.regex !== '') {
+        if (typeof s.regex !== 'string') problems.push(`${where}: regex must be a string`);
+        else if (s.regex.length > 200) problems.push(`${where}: regex is longer than 200 characters`);
+        else { try { new RegExp(s.regex); } catch (e) { problems.push(`${where}: regex does not compile (${String(e.message).slice(0, 80)})`); } }
+      } else if (typeof s.text !== 'string') problems.push(`${where}: needs text`);
+    }
+    if (s.type === 'expectCount' && !(Number.isInteger(s.count) && s.count >= 0)) problems.push(`${where}: count must be a non-negative whole number`);
   });
   return problems;
 }
@@ -504,7 +554,10 @@ function warningsFor(step) {
  * requires rewriting saved tests.
  */
 function decorate(step) {
-  const out = { ...step, text: describe(step), warnings: warningsFor(step) };
+  // On an expectText step `text` is the assertion's DATA (the text to expect), not a display
+  // string. Overwriting it here, then stripping it on save, silently erased the assertion.
+  const out = { ...step, warnings: warningsFor(step) };
+  if (step.type === 'expectText') out.description = describe(step); else out.text = describe(step);
   if (isIdentityTarget(step.target)) {
     out.locatorSummary = require('./identity').summarise(step.target);
   } else if (legacyTargetOf(step)) {
@@ -514,11 +567,14 @@ function decorate(step) {
 }
 
 /** Fields that are computed for display and must not be written to disk. */
-const DERIVED_FIELDS = ['text', 'warnings', 'locatorSummary'];
+const DERIVED_FIELDS = ['text', 'description', 'warnings', 'locatorSummary'];
 
 function stripDerived(step) {
   const out = { ...step };
-  for (const f of DERIVED_FIELDS) delete out[f];
+  for (const f of DERIVED_FIELDS) {
+    if (f === 'text' && out.type === 'expectText') continue;   // data, not display — see decorate()
+    delete out[f];
+  }
   return out;
 }
 
@@ -544,7 +600,7 @@ function looksVolatile(text) {
 
 module.exports = {
   STEP_TYPES, TARGET_KINDS, DERIVED_FIELDS,
-  templateUrl, resolveUrl, isOnApp, samePath,
+  templateUrl, maskSecretQuery, resolveUrl, isOnApp, samePath,
   fromRecorderAction, targetFromLocator,
   describe, describeTarget, targetPhrase, decorate, stripDerived, formatDuration,
   locatorFor, isIdentityTarget, legacyTargetOf, needsTarget,

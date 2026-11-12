@@ -1,34 +1,35 @@
-# Bug Replay Recorder
+<p align="center"><img src="docs/assets/replayr-mark.svg" width="64" height="64" alt="Replayr"></p>
 
-Reproduce a painful bug **once** in a real browser, save it as a readable test, and replay it later
-against whatever code is running on this machine right now.
+# Replayr
+
+**Record once. Replay anywhere.**
+
+Replayr is a local developer tool for production bug replay and fix verification. Reproduce a bug
+**once** on production, in a real browser. Save it as a readable test. Then replay the same steps
+against **localhost**, or any other environment, to prove the bug is fixed.
 
 ```
-Start Recording → browser opens → reproduce the bug → Stop → name it → Save
-                                                                        ↓
-                            change your code … later …  Execute → PASS / FAIL at step N
+Record on Production  ──►  Save as a test  ──►  Replay on Localhost  ──►  Is the bug fixed?
+https://app.example.com                         http://localhost:4201      Passed · Failed · Inconclusive
 ```
 
-Local-only developer tool: a small Node.js service plus a plain HTML/CSS/JS page, with Playwright as
-its only dependency. It drives an application running on this machine; it does not need to live
-inside that application's repository.
+It is a small Node.js service plus a plain HTML/CSS/JS interface, with Playwright as its only
+dependency. It binds to `127.0.0.1`, makes no external requests, and does not need to live inside
+the repository of the application it drives.
 
-## What is different since the rebuild
+Three things set it apart:
 
-A recorded step used to be one selector. One selector is a single point of failure: rename the
-button, restyle it, move it two `<div>`s deeper, and the step breaks even though nothing about the
-application is wrong.
-
-A step is now an **identity fingerprint plus a validated, scored set of ways to find the element
-again**. The promise is:
-
-- If the button's text, CSS classes or DOM nesting change, the step **still finds it**.
-- If the element is genuinely gone, or genuinely a different element, the step **fails** — it never
-  clicks something else that happens to be in the same place.
-- When it fails, it tells you exactly which strategies were tried, what each one found, and why
-  each was rejected.
-
-The whole engine is in [`src/identity/`](src/identity/) and has [its own guide](src/identity/README.md).
+- **Environment-aware replay.** A test remembers where it was recorded. When you replay it, the
+  recorded URLs follow you to the target environment, and a replay against localhost can never
+  wander onto production. See [docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md).
+- **Honest results.**
+  - **Passed** means an assertion verified the expected behaviour.
+  - **Inconclusive** means the steps completed but nothing was checked.
+  - **Failed**, **Blocked**, **Error** and **Cancelled** say *why*.
+- **An element identity engine that refuses to guess.** A step stores a fingerprint and a scored
+  set of locators, not one selector. It survives renamed text, new classes and re-nesting. When it
+  cannot tell which of several elements was meant, it stops and explains instead of clicking the
+  wrong one. See [src/identity/README.md](src/identity/README.md).
 
 ---
 
@@ -42,118 +43,114 @@ npx playwright install chromium     # first time only: downloads the browser bui
 npm start                           # → http://127.0.0.1:4310
 ```
 
-Open `http://127.0.0.1:4310` in your browser. The app you want to record (by default the UI Shell
-at `http://localhost:4201`) must be up, because that is what gets driven.
+Open `http://127.0.0.1:4310`. Then:
 
-Then:
-
-1. **Record** → pick the app → **Start recording**. A Chromium window opens, already signed in.
-2. Reproduce the bug. Steps appear in the list as you go, in plain English.
-3. **Stop**, give it a name, **Save**.
-4. Change your code. Come back, press **Execute**. You get PASS, or FAIL at step N with a
-   screenshot, the URL, the console errors and the locator attempts log.
+1. **Applications & Environments.** Add your application's environments, for example
+   *Production* `https://app.example.com` and *Localhost* `http://localhost:4201`. Production is
+   protected automatically.
+2. **Record Bug.**
+   1. Pick the application and the **source environment** (Production). Optionally describe the
+      bug: expected behaviour, actual behaviour and severity.
+   2. Start recording. Chromium opens. Reproduce the bug. Every action appears in the live timeline
+      as a plain sentence, such as *Clicked "Save"* or *Filled "Email"*. Password-like fields are
+      redacted.
+   3. Stop and review. Add an **assertion** for the expected behaviour, for example *Expect text
+      "Total: 42.00"*. Without one, a replay can only say the steps completed.
+3. **Save**, then open the test. The environment strip reads **Recorded on Production → Run on
+   Localhost**. Press **Run**.
+4. Read the report.
+   - **Failed · assertion failed** means the bug still reproduces.
+   - **Passed** means the fix is verified.
+   - Every failure comes with the step, a screenshot, console and network errors, and what the
+     locator engine tried.
 
 ---
 
-## The four screens
+## The screens
 
-Views are driven by the URL hash, so reload and Back both work.
+Views are driven by the URL hash, so reload and Back both work. `Ctrl/⌘ K` opens the command
+palette, and `?` lists the keyboard shortcuts.
 
-| Hash | Screen | What it does |
+| Hash | Screen | What it is for |
 |---|---|---|
-| `#/tests` | **Library** | Every saved test, its step count and last result. Search, filter by all / passed / failed / never run. Execute, Edit, open the last run, Delete. |
-| `#/record` | **Recorder** | The live step list while you work, then the draft to name, tidy and save. |
-| `#/test/:id` | **Test detail** | The saved steps, editable values, and the inspector. |
-| `#/run/:testId/:runId` | **Run result** | Per-step outcome and timing; on a failure the error, URL, screenshot, console errors, failed requests and what the locator engine tried. `:runId` is `live` while a run is in flight. |
+| `#/home` | **Overview** | Counts, tests that need attention, recent executions, environments, and quick actions to record or run. |
+| `#/tests` | **Test Library** | Every test with application, source environment, last result and reason, last run, and recent history. Search, filter by status/application/tag, sort, group by application, bulk delete. |
+| `#/record` | **Record Bug** | The four stages:<br>• Setup wizard: application → source environment → bug details → start.<br>• Live workspace: timeline · live page · inspector, with a control bar.<br>• Review: edit, reorder, delete, add assertions and waits.<br>• Save. |
+| `#/test/:id` | **Test detail** | Recorded-on → Run-on environment strip, bug details, assertions, steps, run history, settings. |
+| `#/run/:testId/:runId` | **Execution report** | The verdict ("Is the bug fixed?"), environment, timing, and step-by-step debugging. Locator diagnostics, console errors, network failures, dialogs and URL rewrites are each one disclosure away. `:runId` is `live` while a run is in flight, and the run can be cancelled. |
+| `#/executions` | **Execution History** | Every run, with result, reason and environments (recorded → ran), filterable. |
+| `#/environments` | **Applications & Environments** | Environments grouped by application, each with kind (production/staging/development/local), URL, login and protection. |
+| `#/trash` | **Trash** | Deleted tests, restorable. The last 50 deletions are kept. |
+| `#/settings` | **Settings** | Theme (system/light/dark), recording and replay preferences, data and privacy, shortcuts. |
 
-Besides recording and running, the service can **pause and resume** a recording (Playwright's
-recorder keeps running underneath; we simply stop accepting what it reports, which is safer than
-re-entering the memoised `_enableRecorder`), **duplicate** a test, **import** a whole test as JSON
-(its id, dates and history are ignored — this machine mints its own), and **open a plain logged-in
-browser** with no recorder attached, for when you just want to look at something.
+`/recorder` is a compact live panel that can sit beside the application while you record. It
+shows status, the environment (with a production warning), the current page, the timeline, and
+Pause/Stop/Discard. It has a compact mode.
 
 ### The inspector
 
-Select any step, in the recorder or in a saved test, and the right-hand pane explains how it will
-be found:
+Select any step, in the recorder or in a saved test, and the inspector explains how it will be
+found:
 
-- **Element** — tag, role, accessible name, where the name came from, own text, the attributes that
-  were kept, and how many elements shared this identity when it was recorded.
-- **How it will be found** — the candidate list, best first, each with its score, the sentence
-  explaining that score, and a green/amber/red badge saying what happened when it was run against
-  the live page (`verified`, `3 matches`, `matched nothing`).
-- **Context** — the breadcrumb of semantic containers the element sits in.
-- **Signals we distrust** — every attribute that was **rejected**, with the reason
-  (`id: mat-input-27 · a framework-generated id`), plus any blind spot.
-- **Warnings** — the fragility hints, computed from the fingerprint, not guessed by the page.
+- **Element.**
+  - What it shows: tag, role, accessible name and where the name came from, own text, the
+    attributes that were kept.
+  - Also how many elements shared this identity when it was recorded.
+- **How it will be found.**
+  - The candidate list, best first, each with its score and the sentence explaining that score.
+  - A badge for what happened when it was run against the live page.
+- **Context.** The breadcrumb of semantic containers the element sits in.
+- **Signals we distrust.** Every attribute that was rejected, with the reason.
+- **Warnings.** Fragility hints computed from the fingerprint.
 
 ---
 
 ## Where things live
 
-| Path | What |
-|---|---|
 ```
 src/                  server-side code
   identity/           the element identity engine
-ui/                   the browser page (static, served by src/server.js)
-tests/                the offline engine test suite
+ui/                   the browser interface (static, served by src/server.js)
+docs/                 ENVIRONMENTS.md, DESIGN.md, assets/ (the Replayr mark)
+tests/                the automated suites and the sample app they drive
 scripts/selftest.js   end-to-end smoke test against a running app
-local-tests/          your recorded tests and run evidence (git-ignored, created on first save)
-.auth/                saved login sessions (git-ignored)
+local-tests/          your tests, environments and run evidence (git-ignored, created on first save)
+.auth/                saved login sessions per environment (git-ignored)
 ```
 
 | Path | What |
 |---|---|
-| `src/server.js` | the local HTTP service, bound to `127.0.0.1`; owns one recording and one run |
-| `src/config.js` | ports, app base URLs, timeouts, where tests go |
-| `src/auth.js` | reuses and renews the saved Keycloak session |
-| `src/recording.js` | owns the recording browser, correlates actions to elements, builds the draft |
-| `src/execution.js` | fresh context, replay, failure evidence |
-| `src/steps.js` | the step model: recorded action → step → plain English → Playwright locator |
-| `src/storage.js` | test JSON files and run folders |
-| `src/identity/` | **the element identity engine** — see [src/identity/README.md](src/identity/README.md) |
-| `src/identity/CONTRACT.md` | the agreement between the engine's modules |
-| `src/identity/__fixtures__/` | before/after HTML pairs: text change, nesting change, generated ids, duplicates, replaced element, canvas |
-| `ui/index.html` | the main page: plain HTML/CSS/JS, no build step, no external requests |
-| `ui/recorder.html` | the standalone recorder panel |
-| `scripts/selftest.js` | records and replays a real flow against the running Shell — the end-to-end smoke test |
-| `tests/run-all.js` | runs the engine suite, one child process per file |
-| `tests/unit.test.js` | the pure half: stability, candidates, scoring. No browser |
-| `tests/fingerprint.test.js` | Chromium: extraction and matching against the fixture pages |
-| `tests/positional.test.js` | Chromium: the DOM-index / relative-XPath / absolute-XPath fallbacks |
-| `tests/e2e-fixture.test.js` | Chromium: record, change the page, prove the element is still found — or refused |
-| `tests/harness.js` | a small test runner (no framework is installed) |
-| `local-tests/*.json` | your tests |
-| `local-tests/.trash/*.json` | deleted tests, kept so a delete is never final — see below |
-| `local-tests/runs/<test>/<run>/` | `result.json`, `step-N.png`, `console.log` |
-| `recorder.local.env` | optional config overrides, git-ignored |
-| `credentials.local.env` | `OPKEY_USERNAME` / `OPKEY_PASSWORD`, git-ignored |
-| `.auth/ui-shell.json` | the saved Keycloak session, git-ignored |
-
-Every path above is relative to the repository root.
+| `src/server.js` | The local HTTP service, bound to `127.0.0.1`. It owns one recording and one run. Its header comment lists every route. |
+| `src/config.js` | Ports, built-in environments, timeouts, where tests go. |
+| `src/targets.js` | Turns an environment key or a typed URL into a target (kind, protected flag, application). It also owns the user environment store and the typed-login store. |
+| `src/auth.js` | Reuses and renews a saved login session per environment. |
+| `src/recording.js` | Owns the recording browser, correlates actions to elements, redacts secrets, and builds and persists the draft. |
+| `src/execution.js` | Replays in a fresh context. Handles URL rewriting, dialogs, cancel and timeout, result classification and failure evidence. |
+| `src/steps.js` | The step model: recorded action → step → plain English → Playwright locator, plus assertions. |
+| `src/storage.js` | Test JSON files, run folders, trash, and the boot-time sweep of interrupted runs. |
+| `src/identity/` | **The element identity engine.** See [src/identity/README.md](src/identity/README.md). |
+| `ui/index.html` | The app shell: icon sprite, Inter font face, script and stylesheet order. |
+| `ui/core.js` … `ui/actions.js` | The interface as classic scripts sharing one scope. `core.js` holds state, helpers, API, router and render. `overlays.js` holds the palette, modals, menus and toasts. Each `view-*.js` file is one area. `actions.js` holds the delegated events and is loaded last. A view registers its own handlers through `ACTIONS[...]`. |
+| `ui/app.css` | Design tokens and shared components. See [docs/DESIGN.md](docs/DESIGN.md). The other stylesheets (`shell`, `library`, `record`, `features`) are screen-specific. |
+| `ui/recorder.html` / `.js` / `.css` | The standalone live panel. |
+| `ui/fonts/` | Inter (variable, latin), vendored under the SIL OFL. |
+| `tests/run-all.js` | Runs every suite, one child process per file. |
+| `tests/replay.test.js` + `tests/sample-app/` | End-to-end product scenarios against a controllable sample app. Covers production → localhost, bug still present / fixed, no assertion, changed markup, ambiguity, cancel, redaction, dialogs, the protected guard and API round trips. |
+| `local-tests/*.json` | Your tests (`schemaVersion: 2`; older files load unchanged). |
+| `local-tests/environments.json` | Environments you added in the UI. |
+| `local-tests/.trash/*.json` | Deleted tests, restorable from **Trash**. |
+| `local-tests/runs/<test>/<run>/` | `result.json`, `step-N.png`, `console.log` (redacted). |
+| `local-tests/.draft.json` | The in-progress recording. If the service stops, it is offered back to you on the Record screen. |
+| `recorder.local.env` | Optional configuration overrides (git-ignored). |
+| `custom-credentials.local.json` | Which origins have a saved login (username and date only). **Passwords live in the OS keyring:** Windows Credential Manager, macOS Keychain or Linux Secret Service. With no keyring, saving is refused unless you set `REPLAYR_ALLOW_PLAINTEXT_CREDENTIALS=1`. |
+| `credentials.local.env` | Optional `OPKEY_*` logins for the built-in apps. This file is **plaintext**, so prefer keyring accounts `env:OPKEY_*`, which take precedence. See [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md). |
+| `.auth/<env>.json` | Saved login sessions, encrypted with a key held in the OS keyring. The exception is `.auth/ui-shell.json`, which is shared with an external suite: it stays plaintext and is restricted to your user. |
 
 ### Deleting a test does not delete it
 
-A recorded test is fifteen minutes of your afternoon and cannot be regenerated from anything else
-on disk, so `storage.remove()` never unlinks one. The JSON is **moved into
-`local-tests/.trash/`** under `<id>--<timestamp>.json`, and the last 50 deletions are
-kept; older ones are pruned. The run evidence under `runs\<test>\` *is* deleted outright — it is
-large, and it can always be produced again by running the test.
-
-This exists because a test was genuinely lost during development, to a delete nobody could later
-account for. A copy in a trash folder costs a few kilobytes and makes that unrecoverable-by-accident
-case impossible.
-
-Two helpers go with it:
-
-- `storage.listTrash()` — what is recoverable, newest first, as `{ file, name, deletedAt }`.
-- `storage.restoreFromTrash(file)` — puts one back. It is re-created through the normal `create()`
-  path, so it is re-validated on the way in and its id is re-minted if something has since taken
-  the old one. The trash copy is removed once the restore succeeds.
-
-The trash is a safety net, not a feature of the library screen: nothing in the UI lists it. To
-recover a test, call the helper or copy the JSON back out of `.trash\` by hand.
+A deleted test's JSON is moved into `local-tests/.trash/`, and the last 50 deletions are kept.
+Restore one from the **Trash** screen. The run evidence under `runs/<test>/` *is* deleted outright,
+because it can always be produced again by running the test.
 
 ---
 
@@ -180,7 +177,7 @@ exists — it falls back to the most recent *compatible* capture on that page wi
 
 The identity work is asynchronous and serialised, so the step appears in the list instantly and its
 locators fill in a moment later (`identityStatus`: `resolving` → `ok`). Stopping the recording
-waits up to 8 seconds for that work to finish, or the last step of a recording would be saved
+waits up to 2 seconds for that work to finish, or the last step of a recording would be saved
 without its locators.
 
 Noise is dropped on purpose: the first blank page, clicks on the page body, printable keys typed
@@ -213,7 +210,28 @@ For each step:
    confidence, similarity, and the full attempts log).
 
 On the first failing step the run stops and keeps the evidence: the error, the URL, a full-page
-screenshot, console errors and failed requests since the run began, and the timing of every step.
+screenshot, console errors (redacted) and failed requests since the run began, and the timing of
+every step. The steps it never reached are listed as *not run*.
+
+Also during replay:
+
+- **URLs follow the target.** `{{baseUrl}}` becomes the target environment, and absolute URLs on
+  the recorded environment are rewritten. Every rewrite is listed in the report.
+- **Native dialogs are handled deliberately.** `confirm()`/`alert()`/`prompt()` are accepted by
+  default, or as set on the step with `dialog: "dismiss"`. Each one is listed in the report.
+- **Runs can be stopped.** A run can be cancelled from the report, and is capped by a run timeout
+  (10 minutes by default, `settings.runTimeoutMs` per test). A run cut short by the service stopping
+  is marked *Error · interrupted* on the next start.
+- **The result says what it proves:**
+
+| Status | Meaning |
+|---|---|
+| **Passed** | Every step ran and at least one assertion passed: the expected behaviour is verified. |
+| **Inconclusive** | The steps completed but there was no assertion, or a step was skipped. This is **not** proof of a fix. |
+| **Failed** | An assertion failed (the bug still reproduces), an element was not found or was ambiguous, or an action failed. |
+| **Blocked** | The run never started: the app was unreachable or login failed. |
+| **Error** | Infrastructure trouble mid-run: the app went away, the browser crashed, or the run timed out or was interrupted. |
+| **Cancelled** | You stopped it. |
 
 ### Waiting, and why there are no sleeps
 
@@ -334,6 +352,28 @@ notes say "Login session was expired and has been renewed."
 into a test file, a run folder or a screenshot filename. `credentials.local.env` is git-ignored and
 is only read to perform a login.
 
+### Typed application URLs
+
+The Setup form's **Application URL** accepts any `http://` or `https://` address. The server checks
+it again: no other schemes, no `user:pass@` in the URL. A URL equal to a configured app's base URL
+**is** that app, with the same session and credentials. Any other URL is stored on the test as
+`target.app: "url:<base URL>"`, so replay goes back to the same address, and **Run on…** offers it
+next to the configured apps.
+
+Login for a typed URL:
+
+- **Username and password given** on the Setup form: saved for that URL's **origin** in
+  `custom-credentials.local.json` (git-ignored, next to `credentials.local.env`) before the
+  session check, then used by the same automated Keycloak login as above, for recording and for
+  every later replay. Typing a new pair replaces it. **Forget saved login** removes it, and for a
+  typed URL its saved session too. A saved pair also takes precedence over `credentials.local.env`
+  for a configured app on that origin.
+- **None given**: the page opens as-is. If it asks you to sign in, do it by hand in the recording
+  window, but replays will start signed out.
+- Only Keycloak sign-in pages are automated (`#username` / `#password` / `#kc-login`, then the
+  Angular `app-root` booting). On any other login form, enter nothing and sign in by hand.
+- A typed URL **never** falls back to the `OPKEY_*` credentials. They are not sent to an arbitrary host.
+
 `ensureSession()` reports one of `no-auth-needed`, `valid`, `renewed`, `missing-credentials`,
 `login-failed`, `app-unreachable`. Anything but the first three blocks the recording or the run,
 deliberately.
@@ -390,7 +430,9 @@ exit code if anything failed. Run everything from the repo root.
 
 | Command | Needs | What it proves |
 |---|---|---|
-| `npm test` (`node tests/run-all.js`) | nothing but Chromium | all four suites below, each in its own child process so a browser crash cannot take the pure half with it |
+| `npm test` (`node tests/run-all.js`) | nothing but Chromium | every suite below, each in its own child process so a browser crash cannot take the pure half with it |
+| `node tests/targets.test.js` | nothing | environments: kind inference, protection rule, the environment and login stores, corrupt-file safety |
+| `node tests/replay.test.js` | Chromium | **the product end to end** against `tests/sample-app`. Covers:<br>• record on one instance, replay on another, and only the target is touched<br>• bug still present → failed / assertion failed<br>• bug fixed → passed<br>• no assertion → inconclusive<br>• restructured markup is recovered and ambiguous markup is refused without clicking<br>• cancel → cancelled, with not-run steps<br>• secrets are never written, logged or exported<br>• dialogs<br>• the protected-environment guard through the real server |
 | `npm run test:unit` (`node tests/unit.test.js`) | nothing | the pure logic: stability heuristics, candidate generation, scoring. About a second |
 | `npm run test:dom` (`node tests/fingerprint.test.js`) | Chromium | extraction and matching against the static `src/identity/__fixtures__/*.html` pages, with `browser-lib.js` injected exactly the way the recorder injects it |
 | `node tests/positional.test.js` | Chromium | the positional fallbacks: DOM index, relative XPath, absolute XPath — and that they refuse when the element was replaced |
@@ -413,6 +455,22 @@ green; see [src/identity/README.md §11](src/identity/README.md#11-the-code-and-
 ---
 
 ## Safety notes
+
+**Production is protected.** A replay against a protected environment (every `production` one, and
+any you mark) is refused by the server until it is confirmed (`428 confirm-protected`). The UI asks
+first and names the environment. A cross-environment replay never navigates to a protected
+environment's origin.
+
+**Secrets stay out of tests.**
+
+- Values typed into password-like fields are redacted before they leave the recorder. That covers
+  password inputs, `autocomplete` password/OTP/card fields, and names like `token`, `secret`, `cvv`
+  and `api_key`.
+- Storage strips any secret value again on save.
+- Exports carry none.
+- Console evidence is redacted, and failure screenshots mask password fields.
+- Recordings of production can still contain real customer data shown on screen. Treat
+  `local-tests/` as sensitive.
 
 The service binds to `127.0.0.1` and rejects any request carrying a cross-origin `Origin` header,
 so no other machine and no other web page can drive your browser. One recording and one run at a

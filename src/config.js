@@ -1,5 +1,5 @@
 /**
- * Design Studio Tester — configuration. LOCAL ONLY, lives in the launcher folder.
+ * Replayr — configuration. LOCAL ONLY, lives in the launcher folder.
  *
  * Everything the other modules need to know about the machine: which apps can be recorded and
  * where they run, where tests and run evidence are stored, where the saved login lives, and the
@@ -21,7 +21,11 @@
  *   RECORDER_RECORD_IDLE_WAITS=1     record the pauses the user takes as explicit `wait` steps
  *   RECORDER_RECORD_IDLE_MIN_MS=800  a shorter pause is human latency, not something to reproduce
  *   RECORDER_RECORD_IDLE_MAX_MS=10000  the longest pause a recording will reproduce
- *   RECORDER_HIGHLIGHT_MS=300       outline each element for this long during a HEADED replay (0 = off)
+ *   REPLAYR_ALLOW_PLAINTEXT_CREDENTIALS=1  ONLY if the OS credential store is unusable: keep typed-in logins
+ *                                    (and sessions) in plaintext files anyway. Logs a loud warning. Default: refuse.
+ *   REPLAYR_SECRETSTORE=memory|unavailable  TEST SEAM ONLY (in-process secrets / simulate a missing keyring)
+ *   OPKEY_* values may instead live in the OS credential store under account env:<NAME> (e.g. env:OPKEY_PASSWORD)
+ *   RECORDER_HIGHLIGHT_MS=300      outline each element for this long during a HEADED replay (0 = off)
  */
 'use strict';
 
@@ -66,16 +70,18 @@ module.exports = {
    * record and run time, so the same test follows whatever is running locally today.
    */
   apps: {
-    'ui-shell': { label: 'UI Shell', baseUrl: trimSlash(env.RECORDER_UI_SHELL_URL || 'http://localhost:4201'), auth: true },
+    'ui-shell': { label: 'UI Shell', application: 'OpKey Studio', baseUrl: trimSlash(env.RECORDER_UI_SHELL_URL || 'http://localhost:4201'), auth: true, kind: 'local' },
     qa1: {
       label: 'QA1 Studio',
+      application: 'OpKey Studio',
       baseUrl: trimSlash(env.RECORDER_QA1_URL || 'https://qa1.perf-eks.opkeyone.com/studio'),
       auth: true,
       // Shared, remote, and NOT yours. Anything recorded here is done against real QA data with
       // whatever account credentials.local.env holds, so the UI marks it and warns before use.
       remote: true,
+      kind: 'staging',
     },
-    concierge: { label: 'Concierge UI', baseUrl: trimSlash(env.RECORDER_CONCIERGE_URL || 'http://localhost:8080'), auth: false },
+    concierge: { label: 'Concierge UI', application: 'Concierge', baseUrl: trimSlash(env.RECORDER_CONCIERGE_URL || 'http://localhost:8080'), auth: false, kind: 'local' },
   },
   defaultApp: 'ui-shell',
 

@@ -1,5 +1,5 @@
 /**
- * Design Studio Tester — login session.
+ * Replayr — login session.
  *
  * The UI Shell on localhost runs the real Keycloak bootstrap, so every browser we open must carry a
  * Keycloak session. The Playwright suite already keeps one in `.auth/ui-shell.json`; this module
@@ -17,20 +17,79 @@
 'use strict';
 
 const fs = require('fs');
+const { renameSyncRetry } = require('./fsutil');
 const path = require('path');
 const { chromium } = require('playwright');
 const config = require('./config');
+const targets = require('./targets');
+const secretstore = require('./secretstore');
+const crypto = require('crypto');
 
 /** Is there a saved session for this app? Each app keeps its own file - see config.authStateFor. */
 function hasSavedState(app = config.defaultApp) {
   return fs.existsSync(config.authStateFor(app));
 }
 
+/* ── Saved sessions (Playwright storageState) ──────────────────────────────
+ *
+ * A session file holds cookies and tokens, so it is sensitive. Every file this module writes is
+ * restricted to the current user. Files for apps other than ui-shell are also ENCRYPTED with
+ * AES-256-GCM; the key lives in the OS credential store (account "session-key"), never on disk.
+ *
+ * The one exception is `.auth/ui-shell.json`: the external Playwright suite reads and rewrites it
+ * (helpers/auth.setup.ts), so it must remain plain Playwright JSON. It is user-only restricted and
+ * nothing else.
+ *
+ * If the OS credential store is unavailable a session is NOT written (the next run logs in again)
+ * unless REPLAYR_ALLOW_PLAINTEXT_CREDENTIALS=1, which writes it plain with a loud warning.
+ */
+const SESSION_KEY_ACCOUNT = 'session-key';
+const ENC_MARK = 'replayr-enc-v1';
+
+function isSharedPlainSession(app) {
+  return config.authStateFor(app) === config.authStatePath;
+}
+
+function sessionKey(create) {
+  let b64 = secretstore.getSecret(SESSION_KEY_ACCOUNT);
+  if (!b64 && create) {
+    b64 = crypto.randomBytes(32).toString('base64');
+    secretstore.setSecret(SESSION_KEY_ACCOUNT, b64);
+  }
+  return b64 ? Buffer.from(b64, 'base64') : null;
+}
+
+function encryptState(state) {
+  const key = sessionKey(true);
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const data = Buffer.concat([c.update(JSON.stringify(state), 'utf8'), c.final()]);
+  return JSON.stringify({ format: ENC_MARK, iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), data: data.toString('base64') });
+}
+
+/** The decrypted state object, or throws (tampered / wrong key / no key). */
+function decryptState(doc) {
+  const key = sessionKey(false);
+  if (!key) throw new Error('session key not found in the credential store');
+  const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(doc.iv, 'base64'));
+  d.setAuthTag(Buffer.from(doc.tag, 'base64'));
+  return JSON.parse(Buffer.concat([d.update(Buffer.from(doc.data, 'base64')), d.final()]).toString('utf8'));
+}
+
 /** Context options that load the saved session for apps behind login. */
 function storageStateOption(app) {
-  const def = config.apps[app];
+  const def = targets.resolve(app);
   if (!def || !def.auth || !hasSavedState(app)) return {};
-  return { storageState: config.authStateFor(app) };
+  const file = config.authStateFor(app);
+  let doc;
+  try { doc = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return {}; }
+  if (doc && doc.format === ENC_MARK) {
+    try { return { storageState: decryptState(doc) }; } catch (e) {
+      console.warn(`[replayr] WARNING: the saved session for ${app} could not be decrypted (${e.message}); signing in again`);
+      return {};
+    }
+  }
+  return { storageState: file };
 }
 
 /**
@@ -39,8 +98,27 @@ function storageStateOption(app) {
  * credentials.local.env and QA logs in as that user while localhost keeps its own.
  */
 function readCredentials(app = config.defaultApp) {
+  // A login typed into the Setup form for this URL's origin wins: the user gave it on purpose.
+  // A typed URL never falls back to the OPKEY_* env credentials — those are not meant for an
+  // arbitrary host.
+  const def = targets.resolve(app);
+  const typed = def && targets.savedCredentials(def.baseUrl);
+  if (typed) return { ...typed, userKey: 'username', passKey: 'password' };
+  if (def && (def.custom || def.source === 'user')) return { userKey: 'username', passKey: 'password' };
   const env = { ...config.readEnvFile(config.credentialsPath), ...process.env };
-  const first = (keys) => { for (const k of keys) if (env[k]) return env[k]; return undefined; };
+  // Preferred source: the OS credential store, account "env:<KEY>" (e.g. env:OPKEY_USERNAME).
+  // Falls back to the user-managed credentials.local.env / real environment.
+  const useKeyring = secretstore.available().ok;
+  const first = (keys) => {
+    for (const k of keys) {
+      if (useKeyring) {
+        const v = secretstore.getSecret('env:' + k);
+        if (v) return v;
+      }
+      if (env[k]) return env[k];
+    }
+    return undefined;
+  };
   const { user, pass } = config.credentialKeys(app);
   return { username: first(user), password: first(pass), userKey: user[0], passKey: pass[0] };
 }
@@ -66,7 +144,8 @@ async function ensureSession(app = config.defaultApp, {
   context: lentContext = null,
   page: lentPage = null,
 } = {}) {
-  const def = config.apps[app];
+  let def;
+  try { def = targets.resolve(app); } catch (e) { return { status: 'app-unreachable', message: e.message }; }
   if (!def) return { status: 'app-unreachable', message: `Unknown app "${app}"` };
   if (!def.auth) return { status: 'no-auth-needed', message: `${def.label} has no login` };
 
@@ -105,8 +184,15 @@ async function ensureSession(app = config.defaultApp, {
       return { status: 'login-failed', message: 'Neither the app nor a login page appeared within 90 s' };
     }
 
-    const { username, password, userKey, passKey } = readCredentials(app);
+    let creds;
+    try { creds = readCredentials(app); } catch (e) {
+      return { status: 'missing-credentials', message: `Saved login could not be read: ${firstLine(e)}` };
+    }
+    const { username, password, userKey, passKey } = creds;
     if (!username || !password) {
+      if (def.custom || def.source === 'user') {
+        return { status: 'missing-credentials', message: `${def.label} asks for a login and none is saved for it — enter a username and password on the Setup form` };
+      }
       return {
         status: 'missing-credentials',
         message: `Session expired and no ${userKey} / ${passKey} (or OPKEY_USERNAME / OPKEY_PASSWORD) in ${config.credentialsPath}`,
@@ -116,8 +202,21 @@ async function ensureSession(app = config.defaultApp, {
     await page.locator('#username').fill(username);
     await page.locator('#password').fill(password);
     await page.locator('#kc-login').click();
+    // Watch for the three ways a submit can end, and stop at the FIRST one: back on the app (success),
+    // Keycloak re-rendering the form with an error (bad credentials), or a second-factor page (MFA —
+    // never automated, never bypassed). Waiting blindly for the app cost a full minute per wrong
+    // password and reported only a timeout; repeated slow retries also feed account lockout.
+    const outcome = await loginOutcome(page, def.baseUrl, 60_000);
+    if (outcome === 'bad-credentials') {
+      return { status: 'login-failed', message: `${def.label} rejected the saved username or password. Update the login and try again (it was not retried, to avoid an account lockout).` };
+    }
+    if (outcome === 'second-factor') {
+      return { status: 'login-failed', message: `${def.label} asks for a second factor (one-time code / MFA). Replayr does not automate or bypass it: sign in once in a recording window and the saved session is reused.` };
+    }
+    if (outcome !== 'app') {
+      return { status: 'login-failed', message: `Login did not return to ${def.label} within 60 s.` };
+    }
     try {
-      await page.waitForURL((u) => u.origin === new URL(def.baseUrl).origin, { timeout: 60_000 });
       await page.locator('app-root').waitFor({ state: 'attached', timeout: 60_000 });
     } catch (e) {
       return { status: 'login-failed', message: `Login did not return to the app: ${firstLine(e)}` };
@@ -130,6 +229,34 @@ async function ensureSession(app = config.defaultApp, {
     if (ownContext && context) await context.close().catch(() => {});
     if (ownBrowser && browser) await browser.close().catch(() => {});
   }
+}
+
+/**
+ * After the login form is submitted: 'app' once the page is back on the app's origin,
+ * 'bad-credentials' when Keycloak shows its form error, 'second-factor' on an OTP / WebAuthn page,
+ * else 'timeout'. Polls the page state instead of racing waitFor promises, so nothing is left
+ * pending when it returns.
+ */
+async function loginOutcome(page, baseUrl, timeoutMs) {
+  const appOrigin = new URL(baseUrl).origin;
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    let origin = null;
+    try { origin = new URL(page.url()).origin; } catch (e) { /* about:blank mid-redirect */ }
+    if (origin === appOrigin) return 'app';
+    const seen = await page.evaluate(() => {
+      const visible = (sel) => Array.from(document.querySelectorAll(sel)).some((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && (el.textContent || el.value || '').trim() !== '';
+      });
+      if (document.querySelector('#otp, input[name="otp"], #kc-otp-login-form, input[autocomplete="one-time-code"], #kc-form-webauthn')) return 'second-factor';
+      if (visible('#input-error, #input-error-username, #input-error-password, .kc-feedback-text, .alert-error, .pf-c-alert.pf-m-danger, .pf-v5-c-alert.pf-m-danger')) return 'bad-credentials';
+      return null;
+    }).catch(() => null);        // navigation in flight: the context is gone, look again shortly
+    if (seen) return seen;
+    await page.waitForTimeout(250);
+  }
+  return 'timeout';
 }
 
 /** 'app' when the Shell booted on its own origin, 'login' when Keycloak's form showed, else 'timeout'. */
@@ -166,11 +293,47 @@ async function raceLanding(page, timeout) {
 async function saveState(context, app = config.defaultApp) {
   const file = config.authStateFor(app);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  await context.storageState({ path: file });
+  const state = await context.storageState();
+  let text;
+  if (isSharedPlainSession(app)) {
+    text = JSON.stringify(state, null, 2); // shared with the external Playwright suite: stays plain
+  } else if (secretstore.available().ok) {
+    try { text = encryptState(state); } catch (e) {
+      console.warn(`[replayr] WARNING: could not encrypt the session for ${app} (${e.message}); it was not saved`);
+      return;
+    }
+  } else if (secretstore.allowPlaintext()) {
+    console.warn(`[replayr] WARNING: the OS credential store is unavailable; the session for ${app} is saved UNENCRYPTED (REPLAYR_ALLOW_PLAINTEXT_CREDENTIALS=1).`);
+    text = JSON.stringify(state, null, 2);
+  } else {
+    console.warn(`[replayr] WARNING: the OS credential store is unavailable (${secretstore.available().reason}); the session for ${app} was not saved, so the next run signs in again.`);
+    return;
+  }
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, text, { encoding: 'utf8', mode: 0o600 });
+  secretstore.restrictFile(tmp);
+  renameSyncRetry(tmp, file);
 }
+
+/**
+ * credentials.local.env is user-managed plaintext and is never rewritten. If it holds OPKEY_*
+ * values, say so once (names only, never values) and point at the keyring alternative.
+ */
+let warnedEnvFile = false;
+function warnPlaintextEnvFile() {
+  if (warnedEnvFile) return;
+  warnedEnvFile = true;
+  let names = [];
+  try { names = Object.entries(config.readEnvFile(config.credentialsPath)).filter(([k, v]) => /^OPKEY_/.test(k) && v).map(([k]) => k); } catch (e) { return; }
+  if (!names.length) return;
+  console.warn(`[replayr] WARNING: ${path.basename(config.credentialsPath)} holds ${names.length} plaintext OPKEY_* value(s) (${names.join(', ')}). ` +
+    'Prefer the OS credential store: save each value under the account env:<NAME> (service "Replayr"), e.g. env:OPKEY_PASSWORD; ' +
+    'those take priority over this file. See docs for the one-line command per OS.');
+}
+warnPlaintextEnvFile();
 
 function firstLine(e) {
   return String((e && e.message) || e).split('\n')[0];
 }
 
-module.exports = { ensureSession, storageStateOption, hasSavedState };
+module.exports = { ensureSession, storageStateOption, hasSavedState, saveState, readCredentials, warnPlaintextEnvFile };

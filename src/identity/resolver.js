@@ -77,6 +77,26 @@ async function resolve(root, target, options = {}) {
   // The rest are cheap: if the DOM is ready for one, it is ready for all.
   let budget = timeoutMs;
 
+  // If the first semantic candidate matches nothing, the wait budget is SHARED by the whole
+  // semantic band rather than spent on that one candidate: keep re-counting every semantic
+  // candidate until one of them matches or the budget is gone. Only then does the loop below
+  // fall through to the later candidates and the positional band.
+  const semantic = candidates.filter((c) => !isPositional(c));
+  if (semantic.length && !isPositional(candidates[0])) {
+    const locators = [];
+    for (const c of semantic) { try { locators.push(buildLocator(root, c)); } catch (e) { /* reported in the loop */ } }
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let any = false;
+      for (const l of locators) {
+        try { if (await l.count() > 0) { any = true; break; } } catch (e) { /* page busy: count again */ }
+      }
+      if (any || Date.now() >= deadline) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    budget = 250;
+  }
+
   for (const candidate of candidates) {
     const attempt = {
       order: attempts.length + 1,

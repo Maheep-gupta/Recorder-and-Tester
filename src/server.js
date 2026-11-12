@@ -1,5 +1,5 @@
 /**
- * Design Studio Tester — the local service. DEV ONLY, never committed, never deployed.
+ * Replayr — the local service. DEV ONLY, never committed, never deployed.
  *
  * Binds to 127.0.0.1 so nothing off this machine can drive the browser, serves the one page, and
  * exposes a small JSON API over it. It owns exactly one recording browser and one run at a time.
@@ -10,15 +10,25 @@
  * Routes
  *   GET    /                        the page
  *   GET    /recorder                the narrow recorder panel, to sit beside the app being recorded
- *   GET    /api/config              apps + base URLs + where tests live
+ *   GET    /api/config              apps (config + user environments, with kind/protected/source),
+ *                                  saved-login origins, where tests live
+ *   GET    /api/environments        { environments: [{ key, label, baseUrl, kind, protected, source, auth }] }
+ *   POST   /api/environments        { key, label?, baseUrl, kind?, protected?, auth? } -> 201 { environment }
+ *   PUT    /api/environments/:key   replace one user environment -> { environment }
+ *   DELETE /api/environments/:key   -> { deleted: true }; built-in apps answer 400, unknown keys 404
  *   GET    /api/events              server-sent events: recording state and run progress
  *   GET    /api/stats               how the whole shelf of tests stands
  *   GET    /api/recording           current recording state (the draft)
- *   POST   /api/recording/start     { app?, headed?, browser?, viewport? }
+ *   POST   /api/recording/start     { app?, headed?, browser?, viewport?, username?, password? }
+ *                                  `app` is a configured key or any http(s) URL; a username and
+ *                                  password, when given, are saved for that URL's origin
+ *   DELETE /api/logins              { app } forget the login saved for that app's origin
  *   POST   /api/recording/stop
  *   POST   /api/recording/pause     hold the recorder without ending the draft
  *   POST   /api/recording/resume    carry on
  *   POST   /api/recording/discard
+ *   GET    /api/recording/recovered the draft autosaved before a crash, or { draft: null }
+ *   DELETE /api/recording/recovered throw that autosaved draft away
  *   POST   /api/recording/step      { type, at?, stepId?, ms?, text?, value?, checked?, url? }
  *                                  add a step by hand: a wait, a waitForXhr or an assertion.
  *                                  `at` is the 0-based index to insert BEFORE; absent = append.
@@ -38,15 +48,24 @@
  *   POST   /api/tests/import        a whole test as JSON, from an export or by hand
  *   GET    /api/tests/:id           one test with per-step text and warnings
  *   GET    /api/tests/:id/export    the raw stored shape, as a download — feeds /api/tests/import
- *   PUT    /api/tests/:id           { name?, description?, steps?, settings?, tags?, folder?, favorite? }
+ *   PUT    /api/tests/:id           { name?, description?, steps?, settings?, tags?, folder?, favorite?, bug? }
+ *   GET    /api/trash               deleted tests that can still be restored
+ *   POST   /api/trash/restore       { file } put one back (a new id is minted if the old one is taken)
  *   DELETE /api/tests/:id
  *   POST   /api/tests/:id/duplicate a copy, with no history
- *   POST   /api/tests/:id/run       { headed?, app? } → starts a run, replies with the run id
- *                                  `app` replays against a different environment than the recording
+ *   POST   /api/tests/:id/run       { headed?, app?, confirmProtected? } -> starts a run, replies with the run id
+ *                                  `app` replays against a different environment than the recording.
+ *                                  A protected environment (production, remote, or flagged) answers
+ *                                  428 { code: "confirm-protected", target } until the caller
+ *                                  repeats the request with confirmProtected: true.
+ *   POST   /api/run/cancel          stop the run in flight -> { cancelling: true, testId }; 409 if none
  *   GET    /api/runs                every test's runs, newest first: ?limit=50
  *   GET    /api/tests/:id/runs      run history
  *   GET    /api/tests/:id/runs/:run one run's result
  *   GET    /api/tests/:id/runs/:run/file/:name   screenshot / console log
+ *   GET    /ui/<name>.css|.js       the page's own stylesheets and scripts
+ *
+ * Errors are { error, code? }: `code` is only present for our own machine-readable codes.
  */
 'use strict';
 
@@ -59,6 +78,7 @@ const config = require('./config');
 const storage = require('./storage');
 const steps = require('./steps');
 const auth = require('./auth');
+const targets = require('./targets');
 const execution = require('./execution');
 const { Recording } = require('./recording');
 
@@ -73,7 +93,7 @@ const PAGE = path.join(UI_DIR, 'index.html');
 /** The narrow recorder panel — a second, standalone page, parked beside the app being recorded. */
 const PANEL = path.join(UI_DIR, 'recorder.html');
 
-const log = (line) => console.log(`[recorder] ${line}`);
+const log = (line) => console.log(`[replayr] ${line}`);
 
 // ────────────────────────────────────────────────────────────── live state
 
@@ -116,7 +136,11 @@ function fail(res, e) {
   // this Node, the end of the service.
   if (res.headersSent) return log(`error after reply: ${(e && e.message) || e}`);
   try {
-    send(res, status, { error: String((e && e.message) || e).split('\n')[0] });
+    const body = { error: String((e && e.message) || e).split('\n')[0] };
+    // Our own machine-readable codes pass through; Node system codes (ENOENT, EACCES...) never do.
+    if (e && typeof e.code === 'string' && !e.code.startsWith('E')) body.code = e.code;
+    if (e && e.target && typeof e.target === 'object') body.target = e.target;
+    send(res, status, body);
   } catch (inner) {
     log(`error while replying: ${(inner && inner.message) || inner}`);
     try { res.destroy(); } catch { /* already gone */ }
@@ -138,11 +162,17 @@ async function readBody(req) {
     chunks.push(c);
   }
   if (!chunks.length) return {};
+  let parsed;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
     throw storage.httpError(400, 'Body is not valid JSON');
   }
+  // `null`, a number, a string or an array parses fine but no route can use it.
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw storage.httpError(400, 'Body must be a JSON object');
+  }
+  return parsed;
 }
 
 /** Decorate a stored test for the page: plain-English text and fragility warnings per step. */
@@ -197,20 +227,36 @@ const routes = [
    * The name is whitelisted, so this cannot be walked out of the `ui/` folder. The groups are
    * non-capturing on purpose — group 1 must stay the WHOLE filename.
    */
-  ['GET', /^\/ui\/((?:app|recorder)\.(?:css|js))$/, async (req, res, [name]) => {
+  ['GET', /^\/ui\/([a-z][a-z0-9-]{0,40}\.(?:css|js))$/, async (req, res, [name]) => {
     const file = path.join(UI_DIR, name);
     if (!fs.existsSync(file)) return send(res, 404, { error: `ui/${name} is missing` });
     const type = name.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8';
     send(res, 200, fs.readFileSync(file), { 'Content-Type': type });
   }],
 
+  // Vendored fonts. Same whitelist rule: one flat folder, a fixed name pattern, woff2 only.
+  ['GET', /^\/ui\/fonts\/([a-z][a-z0-9-]{0,60}\.woff2)$/i, async (req, res, [name]) => {
+    const file = path.join(UI_DIR, 'fonts', name);
+    if (!fs.existsSync(file)) return send(res, 404, { error: `ui/fonts/${name} is missing` });
+    send(res, 200, fs.readFileSync(file), { 'Content-Type': 'font/woff2', 'Cache-Control': 'max-age=86400' });
+  }],
+
+  // Bring the recording browser window to the front (the recorder workspace's "Show browser").
+  ['POST', /^\/api\/recording\/focus$/, async (req, res) => {
+    const ok = await recording.focus();
+    send(res, ok ? 200 : 409, ok ? { focused: true } : { error: 'No recording window is open' });
+  }],
+
   ['GET', /^\/api\/config$/, async (req, res) => send(res, 200, {
-    apps: Object.fromEntries(Object.entries(config.apps).map(([k, v]) => [k, {
+    apps: Object.fromEntries(targets.listEnvironments().map((v) => [v.key, {
       label: v.label, baseUrl: v.baseUrl, auth: v.auth, remote: !!v.remote,
+      kind: v.kind, protected: v.protected, source: v.source,
       // per app, because each one now keeps its own session file
-      hasSavedLogin: v.auth ? auth.hasSavedState(k) : null,
+      hasSavedLogin: v.auth ? auth.hasSavedState(v.key) : null,
     }])),
     defaultApp: config.defaultApp,
+    // Origins that have a username/password saved from the Setup form. Never the values.
+    savedLogins: targets.savedLoginOrigins(),
     testsDir: storage.TESTS,
     headedRun: config.headedRun,
     hasSavedLogin: auth.hasSavedState(),
@@ -223,6 +269,26 @@ const routes = [
     browsers: recording.availableEngines(),
     user: whoAmI(),
   })],
+
+  ['GET', /^\/api\/environments$/, async (req, res) => send(res, 200, { environments: targets.listEnvironments() })],
+
+  ['POST', /^\/api\/environments$/, async (req, res) => {
+    const body = await readBody(req);
+    const environment = targets.saveEnvironment(body);
+    log(`environment saved: ${environment.key} (${environment.kind}${environment.protected ? ', protected' : ''})`);
+    send(res, 201, { environment });
+  }],
+
+  ['PUT', /^\/api\/environments\/([^/]+)$/, async (req, res, [key]) => {
+    const body = await readBody(req);
+    send(res, 200, { environment: targets.saveEnvironment({ ...body, key }) });
+  }],
+
+  ['DELETE', /^\/api\/environments\/([^/]+)$/, async (req, res, [key]) => {
+    if (!targets.deleteEnvironment(key)) throw storage.httpError(404, `No environment "${key}"`);
+    log(`environment deleted: ${key}`);
+    send(res, 200, { deleted: true });
+  }],
 
   ['GET', /^\/api\/stats$/, async (req, res) => send(res, 200, { ...storage.stats(), running: currentRun ? 1 : 0 })],
 
@@ -247,16 +313,35 @@ const routes = [
   ['POST', /^\/api\/recording\/start$/, async (req, res) => {
     const body = await readBody(req);
     if (currentRun) throw storage.httpError(409, 'A test is running — wait for it to finish');
-    const state = await recording.start({
-      app: body.app || config.defaultApp,
-      headed: body.headed !== false,
-      // The Setup form's Browser and Viewport choices. Validated in recording.start(), which
-      // answers 400 for an engine that is not installed rather than throwing Playwright's own
-      // message at the page.
-      browser: body.browser || 'chromium',
-      viewport: body.viewport || null,
-      log,
-    });
+    if (recording.active) throw storage.httpError(409, 'A recording is already in progress');
+    const def = targets.require(body.app || config.defaultApp);
+    // A login typed on the Setup form is saved for this URL's origin BEFORE the session check,
+    // so the check can use it. Both fields or neither: half a login is a typo, not a choice.
+    const typedUser = String(body.username || '').trim();
+    const typedPass = String(body.password || '');
+    // recording.start() runs the session check, which reads these from the store, so they have to
+    // be there first. If start fails they must not outlive it: restore what was there before.
+    const hadTyped = !!(typedUser || typedPass);
+    const previous = hadTyped ? targets.credentialSnapshot(def.baseUrl) : null;
+    if (hadTyped) targets.saveCredentials(def.baseUrl, typedUser, typedPass);
+    let state;
+    try {
+      state = await recording.start({
+        app: def.key,
+        headed: body.headed !== false,
+        // The Setup form's Browser and Viewport choices. Validated in recording.start(), which
+        // answers 400 for an engine that is not installed rather than throwing Playwright's own
+        // message at the page.
+        browser: body.browser || 'chromium',
+        viewport: body.viewport || null,
+        log,
+      });
+    } catch (e) {
+      if (hadTyped) {
+        try { targets.restoreCredentials(def.baseUrl, previous); } catch (inner) { log(`could not roll back the typed login: ${inner.message}`); }
+      }
+      throw e;
+    }
     send(res, 200, state);
   }],
 
@@ -273,6 +358,17 @@ const routes = [
     if (typeof recording.resume !== 'function') throw storage.httpError(501, 'Resume is not available in this version');
     await recording.resume();
     send(res, 200, recording.snapshot());
+  }],
+
+  /** A draft the recorder autosaved before a crash or a closed window, if any. */
+  ['GET', /^\/api\/recording\/recovered$/, async (req, res) => {
+    const draft = typeof Recording.readRecoveredDraft === 'function' ? Recording.readRecoveredDraft() : null;
+    send(res, 200, { draft: draft || null });
+  }],
+
+  ['DELETE', /^\/api\/recording\/recovered$/, async (req, res) => {
+    if (typeof Recording.clearRecoveredDraft === 'function') Recording.clearRecoveredDraft();
+    send(res, 200, { cleared: true });
   }],
 
   ['POST', /^\/api\/recording\/discard$/, async (req, res) => { recording.discard(); send(res, 200, recording.snapshot()); }],
@@ -367,10 +463,9 @@ const routes = [
   // navigation, only for the window to exist.
   ['POST', /^\/api\/browser\/open$/, async (req, res) => {
     const body = await readBody(req);
-    const app = body.app || config.defaultApp;
-    const def = config.apps[app];
-    if (!def) throw storage.httpError(400, `Unknown app "${app}"`);
-    await closePlainBrowser();          // one at a time, or the desktop fills up with windows
+    const def = targets.require(body.app || config.defaultApp);
+    const app = def.key;
+    await closePlainBrowser();         // one at a time, or the desktop fills up with windows
     const { chromium } = require('playwright');
     const browser = await chromium.launch({ headless: false, args: ['--start-maximized'] });
     plainBrowser = browser;
@@ -381,6 +476,17 @@ const routes = [
       .catch((e) => log(`browser: ${String((e && e.message) || e).split('\n')[0]}`));
     log(`opened a plain browser on ${def.baseUrl}`);
     send(res, 200, { opened: true, app, baseUrl: def.baseUrl });
+  }],
+
+  // Forget the username/password saved from the Setup form for this app's origin, and its
+  // saved session with it, so the next recording or run starts from a clean login.
+  ['DELETE', /^\/api\/logins$/, async (req, res) => {
+    const body = await readBody(req);
+    const def = targets.require(body.app);
+    const forgot = targets.forgetCredentials(def.baseUrl);
+    // The session was earned with that login: drop it for every kind of target, not just typed URLs.
+    if (forgot || def.custom) fs.rmSync(config.authStateFor(def.key), { force: true });
+    send(res, 200, { forgot, app: def.key, savedLogins: targets.savedLoginOrigins() });
   }],
 
   ['GET', /^\/api\/tests$/, async (req, res) => send(res, 200, { tests: storage.list() })],
@@ -395,6 +501,7 @@ const routes = [
       tags: body.tags,
       folder: body.folder,
       favorite: body.favorite,
+      bug: body.bug,
       // NOT `(body.steps || []).map(...)`: a caller who sends `steps` as an object or a string
       // deserves storage's "steps must be a list" 400, not a TypeError dressed up as a 500.
       steps: Array.isArray(body.steps) ? body.steps.map(stripUi) : body.steps,
@@ -442,7 +549,7 @@ const routes = [
    * exactly what `POST /api/tests/import` accepts — export here, import on another machine.
    * Must sit before `GET /api/tests/:id`: `export` is not a test id.
    */
-  ['GET', /^\/api\/tests\/([a-z0-9-]+)\/export$/, async (req, res, [id]) => send(res, 200, storage.load(id), {
+  ['GET', /^\/api\/tests\/([a-z0-9-]+)\/export$/, async (req, res, [id]) => send(res, 200, storage.exportable(id), {
     'Content-Disposition': `attachment; filename="${id}.json"`,
   })],
 
@@ -451,7 +558,10 @@ const routes = [
   ['PUT', /^\/api\/tests\/([a-z0-9-]+)$/, async (req, res, [id]) => {
     const body = await readBody(req);
     const patch = { ...body };
-    if (patch.steps) patch.steps = patch.steps.map(stripUi);
+    if (patch.steps !== undefined) {
+      if (!Array.isArray(patch.steps)) throw storage.httpError(400, '"steps" must be a list');
+      patch.steps = patch.steps.map(stripUi);
+    }
     send(res, 200, decorate(storage.update(id, patch)));
   }],
 
@@ -477,19 +587,28 @@ const routes = [
     // Replay somewhere other than where it was recorded - the point of recording on QA and
     // running the same steps against the code on this machine. Steps store {{baseUrl}}, so the
     // substitution is honest; what it cannot promise is that both environments hold the same data.
-    const app = body.app || (test.target && test.target.app) || config.defaultApp;
-    if (!config.apps[app]) throw storage.httpError(400, `Unknown app "${app}"`);
+    const def = targets.require(body.app || (test.target && test.target.app) || config.defaultApp);
+    const app = def.key;
+    // Never touch a protected environment (production, remote, or flagged) without an explicit yes.
+    if (def.protected && body.confirmProtected !== true) {
+      throw Object.assign(
+        new Error(`"${def.label}" is a protected ${def.kind} environment. Confirm to run against it.`),
+        { status: 428, code: 'confirm-protected', target: { key: def.key, label: def.label, baseUrl: def.baseUrl, kind: def.kind } },
+      );
+    }
 
-    currentRun = { testId: id, progress: { testId: id, app, status: 'starting', total: test.steps.length, steps: [] } };
+    const controller = new AbortController();
+    currentRun = { testId: id, controller, progress: { testId: id, app, status: 'starting', total: test.steps.length, steps: [] } };
     broadcast('run', currentRun.progress);
     send(res, 200, { started: true, testId: id, app, stepCount: test.steps.length });
 
     // Started inside a promise so a synchronous throw out of `runTest` still lands in the
     // `.catch` below. Escaping here would leave `currentRun` set forever and 409 every later run.
-    Promise.resolve().then(() => execution.runTest(test, {
+    currentRun.done = Promise.resolve().then(() => execution.runTest(test, {
       app,
       headed,
       log,
+      signal: controller.signal,
       onProgress: (p) => { if (currentRun) currentRun.progress = p; broadcast('run', p); },
     }))
       .then((result) => broadcast('run', { ...result, done: true }))
@@ -498,6 +617,16 @@ const routes = [
         broadcast('run', { testId: id, status: 'blocked', error: String((e && e.message) || e).split('\n')[0], done: true, steps: [], total: test.steps.length });
       })
       .finally(() => { currentRun = null; });
+  }],
+
+  // Ask the run in flight to stop. Execution notices the signal between steps and while waiting,
+  // closes its browser and finishes with status 'cancelled'.
+  ['POST', /^\/api\/run\/cancel$/, async (req, res) => {
+    if (!currentRun) throw storage.httpError(409, 'No run is in progress');
+    const { testId, controller } = currentRun;
+    log(`cancelling run of ${testId}`);
+    controller.abort();
+    send(res, 200, { cancelling: true, testId });
   }],
 
   ['GET', /^\/api\/tests\/([a-z0-9-]+)\/runs$/, async (req, res, [id]) => send(res, 200, { runs: storage.listRuns(id) })],
@@ -568,7 +697,13 @@ async function dispatch(req, res) {
     if (!m) continue;
     if (req.method !== method) { allowed.push(method); continue; }
     try {
-      return await handler(req, res, m.slice(1).map(decodeURIComponent), url);
+      let params;
+      try {
+        params = m.slice(1).map(decodeURIComponent);
+      } catch {
+        return send(res, 400, { error: 'Bad URL encoding' });
+      }
+      return await handler(req, res, params, url);
     } catch (e) {
       return fail(res, e);
     }
@@ -579,7 +714,17 @@ async function dispatch(req, res) {
 
 server.listen(PORT, config.host, () => {
   storage.ensureDirs();
-  log(`listening on http://${config.host}:${PORT}  (local only)`);
+  try {
+    const swept = storage.sweepInterruptedRuns();
+    if (swept) log(`marked ${swept} interrupted run(s) from a previous session`);
+  } catch (e) { log(`could not sweep interrupted runs: ${e.message}`); }
+  // A hard-killed previous server can leave its Chromium behind: kill only ones carrying our owner marker whose owner is dead.
+  Promise.resolve().then(() => execution.sweepOrphanBrowsers(log)).catch((e) => log(`orphan browser sweep failed: ${e.message}`));
+  log(`Replayr — record once, replay anywhere. Listening on http://${config.host}:${PORT}  (local only)`);
+  try {
+    const c = require('./pw-compat').checkCompat();
+    log(`playwright ${c.version}: ${c.ok ? 'compatible' : 'INCOMPATIBLE ' + (c.missing || []).join(', ')}${c.tested ? '' : ' (untested version — recording may fail; see docs/COMPATIBILITY_REPORT.md)'}`);
+  } catch (e) { log(`playwright compatibility check failed: ${e.message}`); }
   log(`tests: ${storage.TESTS}`);
   for (const [key, def] of Object.entries(config.apps)) log(`app ${key}: ${def.baseUrl}${def.auth ? ' (login required)' : ''}`);
   if (!auth.hasSavedState()) log('NOTE: no saved login yet — the first recording will log in with credentials.local.env');
@@ -595,11 +740,29 @@ async function shutdown(why) {
   // awaited here — `process.exit` would otherwise orphan a Chromium.
   try { await recording.stop(); await recording.teardown; } catch { /* closing anyway */ }
   try { await closePlainBrowser(); } catch { /* closing anyway */ }
+  if (currentRun && currentRun.controller) {
+    try { currentRun.controller.abort(); } catch { /* going down */ }
+    // Let the run write its own 'cancelled' result before the process goes: bounded, so a wedged
+    // browser cannot stop the service from exiting.
+    if (currentRun.done) await Promise.race([currentRun.done.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 6000))]);
+  }
+  if (typeof execution.closeAll === 'function') {
+    // Bounded: a hung browser must not stop the service from ever exiting.
+    await Promise.race([
+      Promise.resolve().then(() => execution.closeAll()).catch(() => { /* closing anyway */ }),
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
+  }
   server.close();
   process.exit(0);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGHUP', () => shutdown('SIGHUP'));
+process.on('SIGBREAK', () => shutdown('SIGBREAK'));   // Windows: Ctrl+Break / console close
+// Windows has no deliverable SIGTERM. A parent that spawned us with an IPC channel can ask for a
+// graceful stop with { type: 'shutdown' } (used by the reliability tests and by wrappers).
+process.on('message', (m) => { if (m && m.type === 'shutdown') shutdown('ipc shutdown'); });
 process.on('uncaughtException', (e) => { log(`uncaught: ${e && e.stack}`); shutdown('uncaught exception'); });
 // A rejected promise nobody handled is a bug to see in the log, not a reason to drop the browser
 // and lose the recording in it. Node's default for this is to terminate; that default is wrong here.

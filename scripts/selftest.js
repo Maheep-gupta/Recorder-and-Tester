@@ -1,5 +1,5 @@
 /**
- * Design Studio Tester — self-test against the REAL local app.
+ * Replayr — self-test against the REAL local app.
  *
  * Proves the whole loop without a human: start a recording, drive the browser with synthetic mouse
  * and keyboard input so the recorder sees it exactly as it sees you, stop, check that the identity
@@ -37,7 +37,7 @@ const log = (l) => console.log(`  ${l}`);
 class HarnessError extends Error {}
 
 (async () => {
-  console.log('Design Studio Tester — self-test');
+  console.log('Replayr — self-test');
   const baseUrl = config.apps['ui-shell'].baseUrl;
   console.log(`  app: ${baseUrl}   tests: ${storage.TESTS}`);
 

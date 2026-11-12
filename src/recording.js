@@ -1,5 +1,5 @@
 /**
- * Design Studio Tester — recording.
+ * Replayr — recording.
  *
  * Owns the ONE browser a recording runs in, and combines two independent sources of truth:
  *
@@ -22,12 +22,17 @@
  */
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { EventEmitter } = require('events');
 const { chromium, firefox, webkit } = require('playwright');
 const config = require('./config');
 const auth = require('./auth');
+const targets = require('./targets');
 const steps = require('./steps');
 const identity = require('./identity');
+const pw = require('./pw-compat');
+const urlsafety = require('./urlsafety');
 
 /** The page-side function our injected capture calls. Named to be obvious in a stack trace. */
 const BINDING = '__opkeyRecorderCapture';
@@ -64,6 +69,12 @@ const HIGHLIGHT_HOST_ID = BAR_HOST_ID + '_hl';
  * RECORDER_HIGHLIGHT=0 turns it off for both recording and replay.
  */
 const RECORD_HIGHLIGHT = config.recordHighlight;
+
+/** Recorder action names steps.fromRecorderAction handles (some map to no step on purpose). */
+const RECORDER_ACTIONS = new Set([
+  'openPage', 'closePage', 'navigate', 'click', 'hover', 'fill', 'press', 'check', 'uncheck',
+  'select', 'setInputFiles', 'assertVisible', 'assertText', 'assertValue', 'assertChecked', 'assertSnapshot',
+]);
 
 /** How far back to look for the element a recorder action belongs to. */
 const CORRELATION_WINDOW_MS = 8000;
@@ -183,6 +194,55 @@ const REDACTED = '[redacted — looked like a credential]';
 const SECRETY_PARAM = /token|secret|password|key|auth|code|session|sig|signature/i;
 
 /**
+ * Field-level credential heuristics, applied to a typed value BEFORE the step is emitted.
+ *
+ * Deliberately broad: over-redacting a harmless field costs the user one re-typed value at
+ * replay, under-redacting puts a password in a saved test. `pass` also matches "passenger" and
+ * that is accepted.
+ */
+const SECRET_FIELD_NAME = /pass|pwd|secret|token|otp|cvv|cvc|card.?num|ssn|api.?key/i;
+const SECRET_AUTOCOMPLETE = /password|cc-|one-time-code/i;
+
+/**
+ * Is this field a credential?
+ *
+ * @param f  a Playwright selector string (text heuristics only), or an object with any of
+ *           { selector, type, autocomplete, name, id, ariaLabel, placeholder }.
+ */
+function _isSecretField(f) {
+  if (f == null) return false;
+  if (typeof f === 'string') f = { selector: f };
+  const sel = typeof f.selector === 'string' ? f.selector : '';
+  if (sel) {
+    if (/type\s*=\s*["']?password/i.test(sel)) return true;
+    if (/autocomplete\s*=\s*["']?[^\]"']*(password|cc-|one-time-code)/i.test(sel)) return true;
+    if (SECRET_FIELD_NAME.test(sel)) return true;
+  }
+  if (String(f.type || '').toLowerCase() === 'password') return true;
+  if (f.autocomplete && SECRET_AUTOCOMPLETE.test(String(f.autocomplete))) return true;
+  for (const k of ['name', 'id', 'ariaLabel', 'placeholder']) {
+    if (f[k] && SECRET_FIELD_NAME.test(String(f[k]))) return true;
+  }
+  return false;
+}
+
+/** The same check on an identity fingerprint (what the page captured at focus time). */
+function _fingerprintSecret(fp) {
+  if (!fp) return false;
+  if (fp.secret) return true;
+  const a = fp.attrs || {};
+  return _isSecretField({
+    type: a.type, autocomplete: a.autocomplete, name: a.name, id: a.id,
+    ariaLabel: a['aria-label'], placeholder: a.placeholder,
+  });
+}
+
+const DRAFT_FILE = '.draft.json';
+const DRAFT_DEBOUNCE_MS = 500;
+const PAGE_TITLE_POLL_MS = 1500;
+function draftPath() { return path.join(config.testsDir, DRAFT_FILE); }
+
+/**
  * The steps a person may add to a draft by hand.
  *
  * Short on purpose. A recorded action carries an element identity captured at the instant it
@@ -210,10 +270,21 @@ const COMPATIBLE = {
 class Recording extends EventEmitter {
   constructor() {
     super();
-    this._reset();
+    this._gen = 0;               // bumped by every reset/abort: in-flight async work checks it
+    this.teardown = Promise.resolve();
+    this._draftChain = Promise.resolve();
+    this._draftTimer = null;
+    this._reset(true);           // true: boot — must NOT delete a recoverable draft file
   }
 
-  _reset() {
+  _reset(initial = false) {
+    this._gen++;
+    if (this._pageTimer) { clearInterval(this._pageTimer); this._pageTimer = null; }
+    if (this._draftTimer) { clearTimeout(this._draftTimer); this._draftTimer = null; }
+    if (!initial) this._deleteDraftFile();
+    this._held = new Map();     // step id → { value, values } typed but not yet proven non-secret
+    this._clean = new Set();    // step ids whose field was verified non-secret
+    this.activePage = null;
     this.browser = null;
     this.context = null;
     this.pages = [];            // client Page objects, index = tab number
@@ -235,10 +306,13 @@ class Recording extends EventEmitter {
     this.lastActionAt = null;   // when that action arrived — the clock the idle gap is measured on
     this.actionFetched = false; // did an xhr/fetch follow it inside the grace window?
     this.pending = Promise.resolve();  // serialises the async identity work per action
-    this.teardown = Promise.resolve();  // browser close, running behind an already-answered stop()
+    // `this.teardown` (browser close behind an already-answered stop()) deliberately survives a
+    // reset, so shutdown can still await a close that a quick restart would otherwise hide.
     this.state = {
       status: 'idle',           // idle · starting · recording · stopping · stopped · error
       app: null,
+      target: null,             // { key, label, baseUrl, kind, protected }
+      page: null,               // { url, title } of the page the user is actually on
       baseUrl: null,
       headed: true,
       startedAt: null,
@@ -276,7 +350,8 @@ class Recording extends EventEmitter {
   snapshot() {
     return {
       ...this.state,
-      steps: this.state.steps.map((s) => steps.decorate(s)),
+      // Last line of defence: a step flagged secret never leaves this process with a value.
+      steps: this.state.steps.map((s) => steps.decorate(scrubSecret(s))),
       consoleCount: this.consoleLines.length,
       consoleErrors: this.consoleLines.reduce((n, l) => n + (l.type === 'error' ? 1 : 0), 0),
       networkCount: this.networkCalls.length,
@@ -285,6 +360,109 @@ class Recording extends EventEmitter {
 
   _emit() {
     this.emit('change', this.snapshot());
+    this._scheduleDraft();
+  }
+
+  // ─────────────────────────────────────────── draft recovery
+
+  /** Debounced, atomic write of the draft (no screenshots) to `<testsDir>/.draft.json`. */
+  _scheduleDraft() {
+    const st = this.state.status;
+    if (!['recording', 'stopping', 'stopped'].includes(st) || !this.state.steps.length) return;
+    if (this._draftTimer) return;
+    this._draftTimer = setTimeout(() => {
+      this._draftTimer = null;
+      this._writeDraftFile();
+    }, DRAFT_DEBOUNCE_MS);
+    if (this._draftTimer.unref) this._draftTimer.unref();
+  }
+
+  _writeDraftFile() {
+    const file = draftPath();
+    this._draftChain = this._draftChain.then(async () => {
+      // Decided at execution time, so a discard queued behind this write wins cleanly.
+      const st = this.state.status;
+      if (!['recording', 'stopping', 'stopped'].includes(st) || !this.state.steps.length) return;
+      const s = this.state;
+      const draft = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        status: s.status, app: s.app, target: s.target, baseUrl: s.baseUrl, headed: s.headed,
+        startedAt: s.startedAt, stoppedAt: s.stoppedAt, page: s.page,
+        steps: s.steps.map((x) => draftStep(scrubSecret(x))),
+      };
+      const tmp = file + '.tmp';
+      await fs.promises.mkdir(path.dirname(file), { recursive: true });
+      await fs.promises.writeFile(tmp, JSON.stringify(draft), 'utf8');
+      await fs.promises.rename(tmp, file);
+    }).catch(() => {});
+    return this._draftChain;
+  }
+
+  _deleteDraftFile() {
+    const file = draftPath();
+    this._draftChain = this._draftChain.then(async () => {
+      await fs.promises.unlink(file).catch(() => {});
+      await fs.promises.unlink(file + '.tmp').catch(() => {});
+    }).catch(() => {});
+    return this._draftChain;
+  }
+
+  /** The draft a previous process left behind, or null. Never throws. */
+  static readRecoveredDraft() {
+    try {
+      const d = JSON.parse(fs.readFileSync(draftPath(), 'utf8'));
+      return d && typeof d === 'object' && Array.isArray(d.steps) ? d : null;
+    } catch (e) { return null; }
+  }
+
+  static clearRecoveredDraft() {
+    try { fs.unlinkSync(draftPath()); } catch (e) { /* already gone */ }
+    try { fs.unlinkSync(draftPath() + '.tmp'); } catch (e) { /* none */ }
+  }
+
+  // ─────────────────────────────────────────── the page the user is on
+
+  _setActivePage(p, ctx) {
+    if (ctx && this.context !== ctx) return;
+    this.activePage = p;
+    this._refreshPage(p, false);
+  }
+
+  /** Update state.page from the active page (url now, title when it can be read cheaply). */
+  _refreshPage(p, onlyIfActive) {
+    if (onlyIfActive && p !== this.activePage) return;
+    if (!['starting', 'recording'].includes(this.state.status)) return;
+    const gen = this._gen;
+    const url = netUrl(safeUrl(p));
+    const prev = this.state.page;
+    const apply = (title) => {
+      if (gen !== this._gen || p !== this.activePage) return;
+      const next = { url, title: title != null ? title : (prev && prev.url === url ? prev.title : '') };
+      if (prev && prev.url === next.url && prev.title === next.title) return;
+      this.state.page = next;
+      this._emit();
+    };
+    apply(null);
+    p.title().then((t) => {
+      // `prev` is stale by now; re-read so a newer url is not clobbered with an old title.
+      const cur = this.state.page;
+      if (gen !== this._gen || p !== this.activePage) return;
+      if (cur && cur.url === url && cur.title === String(t || '')) return;
+      this.state.page = { url: cur && cur.url === url ? url : netUrl(safeUrl(p)), title: String(t || '') };
+      this._emit();
+    }).catch(() => {});
+  }
+
+  _watchPage(p, ctx) {
+    p.on('framenavigated', (f) => { if (f === p.mainFrame()) this._setActivePage(p, ctx); });
+    p.on('load', () => { if (this.context === ctx) this._refreshPage(p, true); });
+    p.on('close', () => {
+      if (this.context !== ctx || this.activePage !== p) return;
+      const alive = this.pages.filter((x) => x !== p && !x.isClosed());
+      if (alive.length) this._setActivePage(alive[alive.length - 1], ctx);
+    });
+    this._setActivePage(p, ctx);
   }
 
   /**
@@ -294,14 +472,34 @@ class Recording extends EventEmitter {
   async start({ app = config.defaultApp, headed = config.headedRecording,
                 browser = 'chromium', viewport = null, log = () => {} } = {}) {
     if (this.active) throw Object.assign(new Error('A recording is already in progress'), { status: 409 });
-    const def = config.apps[app];
-    if (!def) throw Object.assign(new Error(`Unknown app "${app}"`), { status: 400 });
+    // A configured app key, a `url:` key or a bare typed URL; malformed URLs throw a 400 here.
+    const def = targets.require(app);
+    app = def.key;
 
-    this._reset();
     const { key: engineKey, engine } = engineFor(browser);
+    this._reset();
+    const gen = this._gen;
     const wantViewport = viewportFor(viewport);
-    Object.assign(this.state, { status: 'starting', app, baseUrl: def.baseUrl, headed, startedAt: new Date().toISOString() });
+    Object.assign(this.state, {
+      status: 'starting', app, baseUrl: def.baseUrl, headed, startedAt: new Date().toISOString(),
+      target: {
+        key: def.key, label: def.label || def.key, baseUrl: def.baseUrl,
+        kind: def.kind || 'local',
+        protected: def.protected !== undefined ? !!def.protected : !!def.remote,
+      },
+    });
     this._emit();
+
+    // stop() or a closed browser during 'starting' bumps `_gen`. Every await below is followed by
+    // a check, and what THIS call launched is closed through the local references — never through
+    // `this.browser`, which by then may belong to a newer recording.
+    let launched = null;
+    const aborted = () => this._gen !== gen;
+    const bail = () => {
+      const err = Object.assign(new Error(this.state.error || 'The recording was stopped before it finished starting'),
+        { status: 409, aborted: true });
+      throw err;
+    };
 
     try {
       // ONE browser for the whole recording.
@@ -315,7 +513,7 @@ class Recording extends EventEmitter {
       // Chrome switch, and a maximised window would silently override the size the form chose.
       const maximise = headed && !wantViewport && engineKey === 'chromium';
       try {
-        this.browser = await engine.launch({ headless: !headed, args: maximise ? ['--start-maximized'] : [] });
+        launched = await engine.launch({ headless: !headed, args: maximise ? ['--start-maximized'] : [] });
       } catch (e) {
         if (/executable doesn't exist|please run the following command/i.test(String(e.message))) {
           throw Object.assign(new Error(
@@ -324,16 +522,29 @@ class Recording extends EventEmitter {
         }
         throw e;
       }
-      this.browser.on('disconnected', () => this._onBrowserGone());
-      this.context = await this.browser.newContext({
+      if (aborted()) bail();
+      const myBrowser = launched;
+      this.browser = myBrowser;
+      myBrowser.on('disconnected', () => this._onBrowserGone(myBrowser));
+      const myContext = await myBrowser.newContext({
         ...auth.storageStateOption(app),
         viewport: wantViewport || (headed ? null : config.viewport),
       });
+      if (aborted()) bail();
+      // Fail fast, before any login or navigation, if the private Playwright APIs are not there.
+      pw.assertCompat({ context: myContext });
+      // Record mode only blocks what nobody should ever reach from a recording: cloud metadata
+      // endpoints and non-web schemes. The human is driving, so nothing else is restricted.
+      this.networkGuard = await urlsafety.installNetworkGuard(myContext, { mode: 'record', target: { baseUrl: def.baseUrl, kind: def.kind } });
+      if (aborted()) bail();
+      this.context = myContext;
       // Every page the recording ever has, including ones the app opens later — the console of a
       // popup is exactly where the interesting error tends to be.
       this.context.on('page', (p) => {
+        if (this.context !== myContext) return;
         if (!this.pages.includes(p)) this.pages.push(p);
         this._watchConsole(p);
+        this._watchPage(p, myContext);
       });
 
       // Did the action the user just performed set off a data call? That single bit decides
@@ -366,7 +577,7 @@ class Recording extends EventEmitter {
       try {
         // Puts `window.playwright` in the main world of every frame, which gives our extractor
         // Playwright's own role and accessible-name computation instead of only our own.
-        await this.context._exposeConsoleApi().catch(() => {});
+        await pw.exposeConsoleApi(this.context).catch(() => {});
         await this.context.exposeBinding(BINDING, (source, payload) => this._onCapture(source, payload));
         await this.context.addInitScript({ content: identity.installSource(BINDING) });
         this.state.captureReady = true;
@@ -399,14 +610,20 @@ class Recording extends EventEmitter {
       // the login happens right here, in this window, and nothing about it can reach the draft:
       // there is no recorder listening yet. That is the same guarantee the throwaway browser used
       // to give, without the throwaway browser.
-      const page = await this.context.newPage();
+      if (aborted()) bail();
+      const page = await myContext.newPage();
+      if (aborted()) bail();
       const session = await auth.ensureSession(app, { log, page });
+      if (aborted()) bail();
       if (!['valid', 'renewed', 'no-auth-needed'].includes(session.status)) {
         throw new Error(`Cannot record while logged out: ${session.message}`);
       }
 
       // ── Playwright's recorder, for the semantics of the action
-      await this.context._enableRecorder(
+      // Goes through the compat adapter, which fails fast with an actionable
+      // IncompatiblePlaywrightError when the installed Playwright lacks the private API.
+      this._log = log;
+      await pw.enableRecorder(myContext,
         {
           mode: 'recording',
           recorderMode: 'api',
@@ -425,8 +642,10 @@ class Recording extends EventEmitter {
       // navigates nowhere on its own, it replays this step. The probe above already loaded the
       // page, so this second visit is a warm one in the same profile; it exists so the recorder,
       // now listening, sees the navigation and writes that step.
+      if (aborted()) bail();
       await page.goto(def.baseUrl, { timeout: config.navigationTimeoutMs })
         .catch((e) => log(`recording: first navigation: ${e.message.split('\n')[0]}`));
+      if (aborted()) bail();
 
       // Measure what actually launched, now that there is a real window to measure. The Setup
       // form's choices are honoured, but a maximised Chromium sizes itself, so the bar must
@@ -440,6 +659,7 @@ class Recording extends EventEmitter {
         const size = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
         this.state.viewport = (size && size.width) ? size : null;
       } catch (e) { this.state.viewport = null; }
+      if (aborted()) bail();
 
       // Anything buffered while the user was logging in belongs to the login, not to the test.
       // Start the correlation buffer empty — and the Console and Network buffers with it, both
@@ -449,14 +669,24 @@ class Recording extends EventEmitter {
       this.consoleLines = [];
       this.networkCalls = [];
       this.state.status = 'recording';
+      this._setActivePage(page, myContext);
+      // Title changes without a navigation (single-page apps) are only visible by asking.
+      this._pageTimer = setInterval(() => { if (this.activePage) this._refreshPage(this.activePage, true); }, PAGE_TITLE_POLL_MS);
+      if (this._pageTimer.unref) this._pageTimer.unref();
       this._emit();
       log(`recording: started on ${def.baseUrl}${this.state.captureReady ? '' : ' (identity capture OFF)'}`);
       return this.snapshot();
     } catch (e) {
+      if (aborted()) {
+        // Stopped (or the window closed) while starting: stop() already set the final state.
+        // Close only what THIS call launched, and leave status alone — no resurrection.
+        await this._closeBrowser(launched);
+        throw e.aborted ? e : Object.assign(new Error(this.state.error || 'The recording was stopped before it finished starting'), { status: 409 });
+      }
       this.state.status = 'error';
       this.state.error = String(e.message || e).split('\n')[0];
       this._emit();
-      await this._closeBrowser();
+      await this._closeBrowser(launched);
       throw e;
     }
   }
@@ -474,19 +704,32 @@ class Recording extends EventEmitter {
    */
   async stop() {
     if (!this.active && this.state.status !== 'recording') return this.snapshot();
+    // Captured SYNCHRONOUSLY, before any await: a quick re-start after this stop() answers must
+    // find `this.browser` belonging to the new recording, never close it, and never leak this one.
+    const b = this.browser;
+    const ctx = this.context;
+    const wasStarting = this.state.status === 'starting';
+    this.browser = null;
+    this.context = null;
+    if (this._pageTimer) { clearInterval(this._pageTimer); this._pageTimer = null; }
+
+    if (wasStarting) {
+      // start() is mid-await. Invalidate it: it re-checks after every await, closes whatever it
+      // launched and bails without touching status.
+      this._gen++;
+    }
     this.state.status = 'stopping';
     this._emit();
 
     // Identity work runs IN the page, so it has to finish before the browser goes — otherwise the
     // last step of every recording is saved with no locators. In practice it is already done: a
     // fingerprint costs tens of milliseconds and the user spent longer reaching for Stop.
-    await Promise.race([this.pending, new Promise((r) => setTimeout(r, STOP_IDENTITY_GRACE_MS))]);
+    if (!wasStarting) await Promise.race([this.pending, new Promise((r) => setTimeout(r, STOP_IDENTITY_GRACE_MS))]);
     this._finish();                       // the draft is final here — the caller can have it now
 
-    const ctx = this.context;
     this.teardown = (async () => {
-      if (ctx) await ctx._disableRecorder().catch(() => {});
-      await this._closeBrowser();
+      if (ctx) await pw.disableRecorder(ctx).catch(() => {});
+      await this._closeBrowser(b);
     })().catch(() => {});
     return this.snapshot();
   }
@@ -648,6 +891,13 @@ class Recording extends EventEmitter {
    * which is both simpler and safer than re-entering `_enableRecorder` (it is memoised per
    * context, so a second call would attach a duplicate set of listeners).
    */
+  /** Bring the recording window's active page to the front. false when there is none. */
+  async focus() {
+    const p = this.activePage;
+    if (!p || (p.isClosed && p.isClosed())) return false;
+    try { await p.bringToFront(); return true; } catch (e) { return false; }
+  }
+
   pause() {
     if (this.state.status !== 'recording') throw Object.assign(new Error('Nothing is being recorded'), { status: 409 });
     this.state.paused = true;
@@ -1002,6 +1252,7 @@ class Recording extends EventEmitter {
     // but if it ever does, the one thing that must not happen is it landing in the user's test.
     // `lastStepId` is deliberately left alone so a later `actionUpdated` still finds its own step.
     if (barAction(data, code)) return;
+    this._checkActionShape(data);
     const now = Date.now();
     const pageIndex = this._pageIndex(page);
     const step = steps.fromRecorderAction(data, code, {
@@ -1018,13 +1269,32 @@ class Recording extends EventEmitter {
     // keystroke of a fill arrives as another update, so it would go out repeatedly. A password
     // must not be on the wire even once, so a cheaper, pessimistic check runs here too, using
     // the same "most recent compatible capture" rule the correlator falls back on anyway.
-    if (step && typeof step.value === 'string' && step.value) {
+    //
+    // Evidence, strongest first: the capture's own secret flag and attributes, then the selector
+    // text. Independent of whether identity attach later succeeds. When there is NO evidence at
+    // all either way (no capture yet), the typed value is HELD back from the wire until
+    // `_attachIdentity` has looked at the real element — see `_held`.
+    let hold = null;
+    let drop = false;
+    if (step && ['fill', 'select', 'press'].includes(step.type)) {
       const recent = this._recentCapture(page, step.type);
-      if (recent && recent.fingerprint && recent.fingerprint.secret) {
-        step.value = '';
-        step.secret = true;
+      const fp = recent && recent.fingerprint;
+      const selector = (data && data.action && data.action.selector) || step.fallbackSelector || '';
+      const secret = _fingerprintSecret(fp) || _isSecretField(selector);
+      if (secret) {
+        if (step.type === 'press') {
+          // A bare character typed into a credential field IS the credential; special keys are not.
+          if (!String(step.key || '').includes('+') && String(step.key || '').length === 1) drop = true;
+        } else {
+          step.value = '';
+          if (step.type === 'select') step.values = [];
+          step.secret = true;
+        }
+      } else if (step.type !== 'press' && !fp) {
+        hold = { value: step.value, values: step.values };
       }
     }
+    if (drop) { if (!isUpdate) this.lastStepId = null; return; }
 
     const list = this.state.steps;
 
@@ -1050,7 +1320,13 @@ class Recording extends EventEmitter {
           };
           // Once a field has been judged secret it stays secret. The check above is per-event
           // and could miss a later keystroke; this cannot un-redact what was already redacted.
-          if (prev.secret) { list[at].secret = true; list[at].value = ''; }
+          if (prev.secret) {
+            list[at].secret = true; list[at].value = '';
+            if (list[at].type === 'select') list[at].values = [];
+          } else if (!list[at].secret) {
+            const h = hold || (this._held.has(prev.id) ? { value: step.value, values: step.values } : null);
+            if (h && !this._clean.has(prev.id)) this._holdValue(list[at], h);
+          }
           // Every keystroke of a fill arrives as an update. The user is still working, so the
           // idle clock restarts here — otherwise typing a long value would be measured as a pause.
           this.lastActionAt = now;
@@ -1080,13 +1356,64 @@ class Recording extends EventEmitter {
 
     step.id = `s${++this.seq}`;
     step.at = steps.templateUrl(safeUrl(page), this.state.baseUrl);
+    if (hold && !step.secret) this._holdValue(step, hold);
     list.push(step);
     this.lastStepId = step.id;
     this.lastActionAt = now;
     this.actionFetched = false;
+    this._setActivePage(page, this.context);
     this._emit();
 
     if (steps.needsTarget(step.type)) this._attachIdentity(page, data.action, step);
+    else this._held.delete(step.id);
+  }
+
+  /**
+   * Validate what the recorder handed us. An action name steps.fromRecorderAction does not know is
+   * silently dropped there (it returns null), which after a Playwright upgrade would look like
+   * "the recorder ignores my clicks". Say so — once per name — instead.
+   */
+  _checkActionShape(data) {
+    const a = data && data.action;
+    const name = a && typeof a === 'object' ? a.name : undefined;
+    let problem = null;
+    if (!a || typeof a !== 'object' || typeof name !== 'string') problem = 'an action with no name';
+    else if (!RECORDER_ACTIONS.has(name)) problem = `an unknown action "${name}"`;
+    if (!problem) return;
+    const key = typeof name === 'string' ? name : '(malformed)';
+    this._warnedActions = this._warnedActions || new Set();
+    if (this._warnedActions.has(key)) return;
+    this._warnedActions.add(key);
+    try {
+      (this._log || (() => {}))(`recording: Playwright's recorder emitted ${problem}; it is ignored (Playwright ${pw.installedVersion() || '?'}, supported ${pw.SUPPORTED.range}). If this is new after an upgrade, see src/pw-compat.js`);
+    } catch (e) { /* logging never breaks a recording */ }
+  }
+
+  /** Keep a typed value off the wire until the real element has been inspected. */
+  _holdValue(step, hold) {
+    this._held.set(step.id, { value: hold.value, values: hold.values });
+    step.value = '';
+    if (Array.isArray(hold.values)) step.values = [];
+    step.valuePending = true;
+  }
+
+  /**
+   * Read the credential-relevant attributes of the element a selector resolves to. Bounded:
+   * a slow page must never hold the identity queue.
+   */
+  async _liveFieldAttrs(page, selector) {
+    if (!selector) return null;
+    let timer = null;
+    try {
+      return await Promise.race([
+        page.locator(selector).first().evaluate((el) => ({
+          type: el.getAttribute('type'), autocomplete: el.getAttribute('autocomplete'),
+          name: el.getAttribute('name'), id: el.id || null,
+          ariaLabel: el.getAttribute('aria-label'), placeholder: el.getAttribute('placeholder'),
+        }), null, { timeout: 800 }),
+        new Promise((r) => { timer = setTimeout(() => r(null), 1000); if (timer.unref) timer.unref(); }),
+      ]);
+    } catch (e) { return null; } finally { if (timer) clearTimeout(timer); }
   }
 
   /**
@@ -1103,18 +1430,32 @@ class Recording extends EventEmitter {
     // async work finishes — which silently left every typed field with no locators at all.
     const current = () => this.state.steps.find((s) => s.id === stepId) || null;
 
+    const gen = this._gen;
     this.pending = this.pending.then(async () => {
+      if (gen !== this._gen) return;   // discarded or restarted while queued
       let found = null;
       try {
         found = await this._findCapture(page, action, step.type);
       } catch (e) { /* treated as "no capture" below */ }
+
+      // Credential check against the real element, whether or not identity attach succeeds.
+      let secretField = false;
+      if (['fill', 'select'].includes(step.type)) {
+        secretField = _isSecretField(action && action.selector) || _isSecretField(step.fallbackSelector)
+          || (found && _fingerprintSecret(found.capture.fingerprint));
+        if (!secretField) {
+          const live = await this._liveFieldAttrs(page, (action && action.selector) || step.fallbackSelector);
+          secretField = _isSecretField(live);
+        }
+      }
+      if (gen !== this._gen) return;
 
       // The picture is taken HERE — as soon as we know WHICH element, and before the locators
       // are validated. Validation runs ten candidates against the live page and can take the
       // best part of a second; the crop is a rectangle measured at the instant of the click, so
       // every millisecond it waits is a millisecond the page has had to scroll, animate or
       // re-render underneath it. The marker still goes onto the target below, once there is one.
-      const shot = found ? await this._captureShot(page, found.capture, stepId) : null;
+      const shot = found && !secretField ? await this._captureShot(page, found.capture, stepId) : null;
 
       const target = found
         ? await identity.buildTarget(found.capture.frame || page, found.capture.fingerprint).catch((e) => ({ __error: e }))
@@ -1122,7 +1463,26 @@ class Recording extends EventEmitter {
 
       const s = current();
       // The step was deleted or merged away while we worked — and so, therefore, is its picture.
-      if (!s) { this.shots.delete(stepId); return; }
+      if (!s) { this.shots.delete(stepId); this._held.delete(stepId); this._clean.delete(stepId); return; }
+
+      // Settle the held value: redact for good if this is a credential field, else restore it.
+      if (secretField) {
+        s.secret = true;
+        s.value = '';
+        if (s.type === 'select') s.values = [];
+        this._held.delete(stepId);
+        delete s.valuePending;
+      } else if (['fill', 'select'].includes(s.type)) {
+        const h = this._held.get(stepId);
+        if (h && !s.secret) {
+          if (typeof h.value === 'string') s.value = h.value;
+          if (Array.isArray(h.values)) s.values = h.values;
+        }
+        this._held.delete(stepId);
+        delete s.valuePending;
+        if (!s.secret) this._clean.add(stepId);
+      }
+      if (secretField && s.target && s.target.shot) delete s.target.shot;
       if (!found) {
         s.identityStatus = 'none';
         s.identityNote = this.state.captureReady
@@ -1140,6 +1500,7 @@ class Recording extends EventEmitter {
         // the run report, or anything downstream of them.
         if (target.fingerprint && target.fingerprint.secret && typeof s.value === 'string') {
           s.value = '';
+          if (Array.isArray(s.values)) s.values = [];
           s.secret = true;
         }
         s.identityStatus = 'ok';
@@ -1200,26 +1561,51 @@ class Recording extends EventEmitter {
 
   // ─────────────────────────────────────────── lifecycle
 
-  _onBrowserGone() {
-    if (this.state.status === 'recording' || this.state.status === 'starting') {
+  /** `b` is the browser that disconnected; a stale one (an earlier recording's) is ignored. */
+  _onBrowserGone(b) {
+    if (b && b !== this.browser) return;
+    const st = this.state.status;
+    if (st === 'starting') {
+      this._gen++;                       // start() notices, cleans up and bails
       this.browser = null;
       this.context = null;
-      this._finish();
+      this.state.status = 'error';
+      this.state.error = 'The browser was closed while the recording was starting';
+      this._emit();
+      return;
     }
+    if (st !== 'recording') return;
+    this.browser = null;
+    this.context = null;
+    if (this._pageTimer) { clearInterval(this._pageTimer); this._pageTimer = null; }
+    this.state.status = 'stopping';
+    this._emit();
+    // Same bounded grace as stop(): identity work already in flight gets a moment to land.
+    const gen = this._gen;
+    Promise.race([this.pending, new Promise((r) => setTimeout(r, STOP_IDENTITY_GRACE_MS))])
+      .then(() => { if (gen === this._gen && this.state.status === 'stopping') this._finish(); });
   }
 
   _finish() {
     if (this.state.status === 'stopped') return;
+    // Anything still unverified when the draft is final is treated as a credential.
+    for (const id of this._held.keys()) {
+      const s = this.state.steps.find((x) => x.id === id);
+      if (s) { s.secret = true; s.value = ''; if (s.values) s.values = []; delete s.valuePending; }
+    }
+    this._held.clear();
     this.state.status = 'stopped';
     this.state.stoppedAt = new Date().toISOString();
     this._emit();
   }
 
-  async _closeBrowser() {
-    const b = this.browser;
-    this.browser = null;
-    this.context = null;
-    this.captures = [];
+  /** Close `b` (captured by the caller before any await). Clears our own references only if they are still `b`'s. */
+  async _closeBrowser(b) {
+    if (b && b === this.browser) {
+      this.browser = null;
+      this.context = null;
+      this.captures = [];
+    }
     if (b) await b.close().catch(() => {});
   }
 }
@@ -1723,6 +2109,25 @@ function sliceSince(buffer, since, limit) {
   return { items, nextSince: items.length ? items[items.length - 1].id : from };
 }
 
+/** A step flagged secret, or still awaiting its credential check, never carries a value out. */
+function scrubSecret(s) {
+  if (!s || !(s.secret || s.valuePending)) return s;
+  const out = { ...s };
+  if ('value' in out) out.value = '';
+  if (Array.isArray(out.values)) out.values = [];
+  return out;
+}
+
+/** A step as written to the draft file: no screenshot markers, no derived display fields. */
+function draftStep(s) {
+  const out = steps.stripDerived ? steps.stripDerived(s) : { ...s };
+  if (out.target && typeof out.target === 'object' && out.target.shot) {
+    out.target = { ...out.target };
+    delete out.target.shot;
+  }
+  return out;
+}
+
 function safeUrl(page) {
   try { return page.url(); } catch { return ''; }
 }
@@ -1731,4 +2136,4 @@ function safeFrameUrl(frame) {
   try { return frame.url(); } catch { return null; }
 }
 
-module.exports = { Recording, BINDING, BAR_BINDING, BAR_HOST_ID, HIGHLIGHT_HOST_ID, RECORD_HIGHLIGHT, barSource };
+module.exports = { Recording, _isSecretField, BINDING, BAR_BINDING, BAR_HOST_ID, HIGHLIGHT_HOST_ID, RECORD_HIGHLIGHT, barSource };

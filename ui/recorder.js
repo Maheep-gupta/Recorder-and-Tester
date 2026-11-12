@@ -1,5 +1,5 @@
 /* ══════════════════════════════════════════════════════════════════════════
-   Design Studio Tester — the STANDALONE PANEL's script.
+   Replayr — the STANDALONE PANEL's script.
 
    One job: mirror the recording, live, in a window narrow enough to sit next
    to the app you are recording. It OWNS nothing. The server holds the draft;
@@ -33,6 +33,8 @@ const S = {
   snap: { status: 'idle', paused: false, steps: [] },
   stepCount: 0,
   sseUp: false,
+  loaded: false,         // true once the first snapshot has arrived
+  away: 0,               // steps that landed while the list was scrolled up
   follow: true,          // auto-scroll while you are at the bottom of the list
   busy: null,            // the command in flight, so a double-click cannot fire twice
   tick: null,            // the elapsed-time interval
@@ -204,11 +206,13 @@ function targetLine(step) {
 
 /** The word at the top. `paused` is a flag on a recording, but here it IS the state. */
 function statusKey(snap) {
+  if (!S.loaded) return 'connecting';
   if (snap.status === 'recording' && snap.paused) return 'paused';
   return snap.status || 'idle';
 }
 
 const STATUS_TEXT = {
+  connecting: 'Connecting…',
   idle: 'No recording in progress',
   starting: 'Opening the browser…',
   recording: 'Recording',
@@ -257,13 +261,14 @@ function paintHeader() {
   document.documentElement.setAttribute('data-rec', key);
   document.title = key === 'recording' ? `● Recording — ${(snap.steps || []).length} steps`
     : key === 'paused' ? '⏸ PAUSED — Recorder'
-    : 'Design Studio Tester — Recorder';
+    : 'Replayr — Recorder';
 
   $('statusText').textContent = STATUS_TEXT[key] || key;
   const n = (snap.steps || []).length;
   $('count').textContent = `${n} ${n === 1 ? 'step' : 'steps'}`;
   $('tabStepCount').textContent = String(n);
   paintElapsed();
+  paintTarget(snap, key);
 
   // Whether the identity engine attached decides how good the locators will be,
   // so it is stated up front rather than discovered when a replay fails.
@@ -287,7 +292,7 @@ function paintHeader() {
   $('session').hidden = !bits.length;
 
   const app = $('appLine');
-  if (snap.app || snap.baseUrl) {
+  if ((snap.app || snap.baseUrl) && !snap.target) {
     app.hidden = false;
     app.textContent = `${snap.app || 'app'} · ${snap.baseUrl || ''}`;
   } else {
@@ -295,6 +300,15 @@ function paintHeader() {
   }
 
   $('pausedBar').hidden = key !== 'paused';
+  // Live controls while there is something to control; Review & save / Discard once it has
+  // stopped. Never both, so the bar keeps its width.
+  const done = key === 'stopped';
+  $('ctlLive').hidden = done || key === 'idle' || key === 'connecting';
+  $('ctlDone').hidden = !done;
+  $('btnDiscard').disabled = !!S.busy;
+  $('btnReview').disabled = !!S.busy || !(snap.steps || []).length;
+  $('btnReview').title = (snap.steps || []).length ? '' : 'Nothing was captured, so there is nothing to review.';
+  if (!done) $('discardBar').hidden = true;
   // One bar, two sources: the recording's own error, or a command the server refused. The
   // command's reason wins — it is the newer news, and it is answering something you just did.
   const problem = S.cmdError || snap.error;
@@ -318,6 +332,45 @@ function paintHeader() {
   setBadge('tabNetworkCount', snap.networkCount);
 }
 
+const KIND_WORD = { production: 'Production', staging: 'Staging', development: 'Development', local: 'Local' };
+
+/** Environment strip, production warning and current page. Every field is optional. */
+function paintTarget(snap, key) {
+  const live = !['idle', 'connecting'].includes(key);
+  const t = snap.target && typeof snap.target === 'object' ? snap.target : null;
+  const kind = t && KIND_WORD[t.kind] ? t.kind : null;
+
+  const strip = $('targetStrip');
+  strip.hidden = !(live && t);
+  if (t) {
+    $('targetLabel').textContent = t.label || t.key || t.baseUrl || 'Environment';
+    $('targetLabel').title = t.baseUrl || '';
+    const badge = $('targetKind');
+    badge.hidden = !kind;
+    badge.className = 'env-badge' + (kind ? ' env-' + kind : '');
+    badge.textContent = kind ? KIND_WORD[kind] : '';
+  }
+
+  const warn = $('prodWarn');
+  const isProd = !!t && kind === 'production';
+  warn.hidden = !(live && t && (t.protected || isProd));
+  $('prodWarnText').textContent = isProd
+    ? 'Recording on PRODUCTION — avoid destructive actions; secrets are redacted'
+    : 'Recording on a protected environment — avoid destructive actions; secrets are redacted';
+
+  const pg = snap.page && typeof snap.page === 'object' ? snap.page : null;
+  const url = pg && pg.url ? String(pg.url) : '';
+  const title = pg && pg.title ? String(pg.title) : '';
+  $('pageStrip').hidden = !(live && (url || title));
+  $('pageTitle').textContent = title;
+  $('pageTitle').title = title;
+  $('pageTitle').hidden = !title;
+  $('pageUrl').textContent = url;
+  $('pageUrl').title = url;
+
+  $('idleCard').hidden = key !== 'idle';
+}
+
 function paintLink() {
   const pill = $('linkPill');
   pill.dataset.state = S.sseUp ? 'up' : 'down';
@@ -329,13 +382,17 @@ function paintLink() {
    Collapsed is the point of this thing: a thin strip parked over the app you are driving.
    Expanded adds the step list and the inspector when you want to read back what was captured.
    ══════════════════════════════════════════════════════════════════════════ */
-const BAR_H = 190;           // title bar + status + session line + the window's own chrome
+const BAR_H = 250;           // title bar + status + session line + the window's own chrome
 const OPEN_H = 780;
 const PANEL_KEY = 'tf.recorderPanel';
+const COMPACT_KEY = 'tf.recorderCompact';   // '1' when compact
 
 function setPanel(mode, resize) {
   document.documentElement.setAttribute('data-panel', mode);
-  try { localStorage.setItem(PANEL_KEY, mode); } catch { /* private window: not worth failing over */ }
+  try {
+    localStorage.setItem(PANEL_KEY, mode);
+    localStorage.setItem(COMPACT_KEY, mode === 'collapsed' ? '1' : '0');
+  } catch { /* private window: not worth failing over */ }
   $('btnCollapse').setAttribute('aria-expanded', String(mode === 'expanded'));
   // resizeTo only works on a window a script opened, and some browsers refuse outright. The
   // CSS already gives the collapsed shape, so a refusal costs nothing but the resize.
@@ -343,12 +400,15 @@ function setPanel(mode, resize) {
     try { window.resizeTo(window.outerWidth, mode === 'collapsed' ? BAR_H : OPEN_H); } catch { /* ignore */ }
   }
   if (mode === 'expanded') scrollToLatest();
-  announce(mode === 'collapsed' ? 'Panel collapsed to the bar.' : 'Panel expanded; captured steps are shown.');
+  announce(mode === 'collapsed' ? 'Compact mode on.' : 'Compact mode off; captured steps are shown.');
 }
 
 function initPanel() {
   let saved = null;
-  try { saved = localStorage.getItem(PANEL_KEY); } catch { /* ignore */ }
+  try {
+    const c = localStorage.getItem(COMPACT_KEY);
+    saved = c === '1' ? 'collapsed' : c === '0' ? 'expanded' : localStorage.getItem(PANEL_KEY);
+  } catch { /* ignore */ }
   // EXPANDED by default. Collapsed-by-default meant the panel opened showing a title bar, a
   // status row and nothing else — the steps, the inspector and the locators were all there,
   // hidden behind a preference nobody had set. Collapse is a thing you choose, not a thing you
@@ -377,7 +437,7 @@ function closeSelf(quiet) {
   setTimeout(() => {
     if (window.closed) return;
     if (quiet) return;
-    $('errText').textContent = 'This tab was not opened by Design Studio Tester, so it cannot close itself. Close it yourself.';
+    $('errText').textContent = 'This tab was not opened by Replayr, so it cannot close itself. Close it yourself.';
     $('errBar').hidden = false;
   }, 250);
 }
@@ -488,6 +548,15 @@ function stepRow(step, i, isNew) {
   }
   li.appendChild(body);
 
+  if (step.secret) {
+    const lock = el('span', 'step-lock');
+    lock.setAttribute('role', 'img');
+    lock.setAttribute('aria-label', 'Secret: the value is hidden and not recorded');
+    lock.title = 'Secret: the value is hidden and not recorded';
+    lock.appendChild(icon('i-lock', 'i i-sm'));
+    li.appendChild(lock);
+  }
+
   const off = stepOffset(step);
   if (off) li.appendChild(el('span', 'step-time tnum', off));
 
@@ -508,7 +577,7 @@ function stepRow(step, i, isNew) {
 }
 
 const EMPTY_TEXT = {
-  idle: ['No recording in progress.', 'Start one from the Design Studio Tester window, then park this panel beside the app.'],
+  idle: ['No recording in progress.', 'Start one from the Replayr window, then park this panel beside the app.'],
   starting: ['Waiting for the browser…', 'The recorder window is opening. Steps appear here the moment you act.'],
   recording: ['Nothing captured yet.', 'Every click, keystroke and navigation in the recorder window lands here.'],
   paused: ['Nothing captured yet.', 'The recorder is paused — resume before you do the thing you want recorded.'],
@@ -537,6 +606,7 @@ function paintSteps() {
     for (let k = S.stepCount; k < filtered.length; k++) {
       list.appendChild(stepRow(filtered[k].s, filtered[k].i, hadRows));
     }
+    if (hadRows && !S.follow) { S.away += filtered.length - S.stepCount; paintJump(); }
   } else {
     list.textContent = '';
     for (const { s, i } of filtered) list.appendChild(stepRow(s, i, false));
@@ -564,7 +634,18 @@ function scrollToLatest() {
   if (!wrap) return;
   wrap.scrollTop = wrap.scrollHeight;
   S.follow = true;
-  $('jump').hidden = true;
+  S.away = 0;
+  paintJump();
+}
+
+/** The "New steps" pill: only when steps landed while you were reading further up. */
+function paintJump() {
+  const j = $('jump');
+  j.hidden = S.away <= 0;
+  if (S.away > 0) {
+    j.lastChild.textContent = S.away === 1 ? '1 new step' : S.away + ' new steps';
+    j.setAttribute('aria-label', 'Jump to the latest step (' + S.away + ' new)');
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1097,9 +1178,9 @@ function paintSettings() {
   const closeStop = el('input');
   closeStop.type = 'checkbox';
   closeStop.setAttribute('aria-label', 'Close this panel when the recording stops');
-  closeStop.checked = p.closeOnStop !== false;
+  closeStop.checked = p.closeOnStop === true;
   closeStop.addEventListener('input', () => setPref('closeOnStop', closeStop.checked));
-  row('Close this panel when recording stops', 'Review and save happen in the main window.', closeStop);
+  row('Close this panel when recording stops', 'Otherwise Review & save and Discard stay here.', closeStop);
 
   body.appendChild(el('p', 'flabel', 'This session'));
   const dl = el('dl');
@@ -1257,6 +1338,7 @@ async function addStep(payload, label) {
 function onSnapshot(snap) {
   const before = S.snap;
   const beforeKey = statusKey(before);
+  S.loaded = true;
   S.snap = snap || { status: 'idle', paused: false, steps: [] };
   const key = statusKey(S.snap);
   const n = (S.snap.steps || []).length;
@@ -1310,7 +1392,9 @@ function onSnapshot(snap) {
 const WAS_LIVE = ['starting', 'recording', 'paused', 'stopping'];
 function maybeCloseAfterStop(beforeKey, key) {
   if (key !== 'stopped' || !WAS_LIVE.includes(beforeKey)) return;
-  if (prefs().closeOnStop === false) return;         // opted out in Settings
+  // Opt-in: the stopped state carries Review & save and Discard, so closing by default would
+  // take them away before they can be used.
+  if (prefs().closeOnStop !== true) return;
   // A beat, so the header visibly reaches "Stopped · N steps" before the window goes. Closing
   // on the same frame as the click reads as a crash rather than as the panel finishing.
   setTimeout(() => closeSelf(true), 600);
@@ -1380,6 +1464,22 @@ $('btnPause').addEventListener('click', () => command('Pause', '/api/recording/p
 $('btnResume').addEventListener('click', () => command('Resume', '/api/recording/resume'));
 $('btnStop').addEventListener('click', () => command('Stop', '/api/recording/stop'));
 $('themeBtn').addEventListener('click', cycleTheme);
+$('btnReview').addEventListener('click', () => {
+  window.open('/#/record/review', 'tf-main');
+  announce('Opened Review and save in the main window.');
+});
+function askDiscard(show) {
+  const n = (S.snap.steps || []).length;
+  $('discardText').textContent = 'Discard this recording (' + n + (n === 1 ? ' step' : ' steps') + ')? This cannot be undone.';
+  $('discardBar').hidden = !show;
+  if (show) $('btnDiscardNo').focus(); else $('btnDiscard').focus();
+}
+$('btnDiscard').addEventListener('click', () => askDiscard(true));
+$('btnDiscardNo').addEventListener('click', () => askDiscard(false));
+$('btnDiscardYes').addEventListener('click', async () => {
+  $('discardBar').hidden = true;
+  await command('Discard', '/api/recording/discard');
+});
 $('jump').addEventListener('click', () => { scrollToLatest(); $('list').lastElementChild?.scrollIntoView({ block: 'nearest' }); });
 
 for (const b of document.querySelectorAll('.mode')) b.addEventListener('click', () => setMode(b.dataset.mode));
@@ -1518,7 +1618,8 @@ $('listWrap').addEventListener('scroll', (e) => {
   const target = e.currentTarget;
   const atBottom = target.scrollHeight - target.scrollTop - target.clientHeight < 24;
   S.follow = atBottom;
-  $('jump').hidden = atBottom || !(S.snap.steps || []).length;
+  if (atBottom) S.away = 0;
+  paintJump();
 });
 
 // Close the menu the way every menu closes.
@@ -1534,6 +1635,7 @@ window.addEventListener('blur', closeMenu);
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (menuOwner) { closeMenu(); return; }
+    if (!$('discardBar').hidden) { askDiscard(false); return; }
     // Advertised on the hint bar, so it has to work — but it is the one key that ends a
     // recording, so it is a preference and it only acts while one is actually running.
     if (prefs().escStops !== false && ['recording', 'starting'].includes(S.snap.status)) {

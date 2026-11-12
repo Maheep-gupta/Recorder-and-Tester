@@ -1,5 +1,5 @@
 /**
- * Design Studio Tester — execution.
+ * Replayr — execution.
  *
  * Replays a saved test in a BRAND-NEW browser context against whatever the app is serving right
  * now. Nothing from the recording is reused except the saved login. Each step goes through
@@ -18,20 +18,257 @@ const path = require('path');
 const { chromium } = require('playwright');
 const config = require('./config');
 const auth = require('./auth');
+const targets = require('./targets');
 const steps = require('./steps');
 const storage = require('./storage');
 const identity = require('./identity');
+const urlsafety = require('./urlsafety');
+const pw = require('./pw-compat');
+const { buildLocator } = require('./identity/locators');
+const { isPositional: isPositionalCandidate } = require('./identity/resolver');
+
+
+/** Every browser this module has launched and not yet closed, so a shutdown can close them all. */
+const browsers = new Set();
+
+let closingAll_ = false;
+async function closeAll() {
+  closingAll_ = true;
+  const list = [...browsers];
+  browsers.clear();
+  await Promise.all(list.map((b) => b.close().catch(() => {})));
+  setTimeout(() => { closingAll_ = false; }, 2000).unref();
+}
+
+const DEFAULT_RUN_TIMEOUT_MS = 600_000;
+
+/** Marker put on every Chromium command line this process launches, so an orphan can be proven ours. */
+const OWNER_FLAG = '--replayr-owner=';
+
+/** browser -> pid of its main process, learned from the OS (Playwright's Browser object does not expose it). */
+const pids = new Map();
+/** browser -> its Playwright temp profile dir (proved ours via the owner marker). */
+const profileOf = new Map();
+
+/** Pids of the browsers currently open (diagnostics and tests). */
+function browserPids() { return [...pids.values()]; }
+
+/**
+ * Launch Chromium for a run. `REPLAYR_CHROMIUM_EXECUTABLE` is a test seam (and an escape hatch for
+ * a locked-down machine that provides its own Chromium). If the caller has already stopped the run
+ * by the time the launch finishes, the browser is closed instead of leaked.
+ */
+function launchBrowser(headed, isStopped) {
+  const opts = { headless: !headed, args: [`${OWNER_FLAG}${process.pid}`] };
+  if (process.env.REPLAYR_CHROMIUM_EXECUTABLE) opts.executablePath = process.env.REPLAYR_CHROMIUM_EXECUTABLE;
+  const p = chromium.launch(opts);
+  p.then((b) => { if (isStopped()) b.close().catch(() => {}); }, () => {});
+  return p;
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return !!e && e.code === 'EPERM'; }
+}
+
+/** [{ pid, commandLine }] for every other process on the machine whose command line carries our marker. */
+async function listMarkedProcesses() {
+  const { execFile } = require('child_process');
+  const sh = (cmd, args) => new Promise((resolve) => execFile(cmd, args, { encoding: 'utf8', timeout: 20000, windowsHide: true, maxBuffer: 32 * 1024 * 1024 }, (err, out) => resolve(err ? '' : String(out))));
+  let rows = [];
+  if (process.platform === 'win32') {
+    const ps = `Get-CimInstance Win32_Process -Filter "CommandLine like '%${OWNER_FLAG}%'" | ForEach-Object { "$($_.ProcessId)\t$($_.CommandLine)" }`;
+    const txt = await sh('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps]);
+    rows = txt.split(/\r?\n/).filter(Boolean).map((l) => { const i = l.indexOf('\t'); return { pid: Number(l.slice(0, i)), commandLine: l.slice(i + 1) }; });
+  } else {
+    const txt = await sh('ps', ['-eo', 'pid=,args=']);
+    rows = txt.split('\n').map((l) => l.trim().match(/^(\d+)\s+(.*)$/)).filter(Boolean).map((m) => ({ pid: Number(m[1]), commandLine: m[2] }));
+  }
+  return rows.filter((r) => r.pid && r.pid !== process.pid && r.commandLine.includes(OWNER_FLAG));
+}
+
+/** Find the main process of the browser this process just launched (marked, not a helper, not yet claimed). */
+async function findBrowserPid() {
+  const claimed = new Set(pids.values());
+  const mine = (await listMarkedProcesses()).filter((r) => r.commandLine.includes(OWNER_FLAG + process.pid) && !/--type=/.test(r.commandLine) && !claimed.has(r.pid));
+  if (!mine.length) return { pid: 0, dir: null };
+  const row = mine[mine.length - 1];
+  const ud = row.commandLine.match(/--user-data-dir=(?:"([^"]+)"|(\S+))/);
+  return { pid: row.pid, dir: ownedProfileDir(ud && (ud[1] || ud[2])) };
+}
+
+/**
+ * A Playwright temp profile is only ever deleted when it is provably ours: it sits DIRECTLY in the OS
+ * temp dir and carries Playwright's own prefix, and the caller learned its path from the command line
+ * of a browser that carried our owner marker (or from our own ledger of such paths).
+ */
+function ownedProfileDir(dir) {
+  if (!dir) return null;
+  const abs = path.resolve(dir);
+  return path.dirname(abs) === path.resolve(require('os').tmpdir()) && /^playwright_chromiumdev_profile-[\w-]+$/.test(path.basename(abs)) ? abs : null;
+}
+
+/** Ledger of profile dirs of live browsers, so a hard-killed process's leftovers can be proven ours at next boot. */
+const ledgerFile = () => path.join(config.testsDir, '.replayr-browser-profiles.json');
+function ledger(mutate) {
+  let list = [];
+  try { list = JSON.parse(fs.readFileSync(ledgerFile(), 'utf8')); if (!Array.isArray(list)) list = []; } catch { /* none yet */ }
+  const next = mutate(list);
+  try { fs.mkdirSync(config.testsDir, { recursive: true }); fs.writeFileSync(ledgerFile(), JSON.stringify(next)); } catch { /* bookkeeping only */ }
+  return list;
+}
+function rmProfile(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* still locked: the next boot retries via the ledger */ }
+  return !fs.existsSync(dir);
+}
+/** Forget a profile dir; remove it first if the browser left it behind (crash). */
+function releaseProfile(dir) {
+  if (!dir) return;
+  if (fs.existsSync(dir)) rmProfile(dir);
+  if (!fs.existsSync(dir)) ledger((l) => l.filter((e) => e.dir !== dir));
+}
+/** Boot: remove ledgered profile dirs whose owner process is gone. */
+function sweepProfileLedger(log = () => {}) {
+  const keep = [];
+  let n = 0;
+  for (const e of ledger((l) => l)) {
+    const dir = e && ownedProfileDir(e.dir);
+    if (!dir) continue;
+    if (e.owner === process.pid || pidAlive(e.owner)) { keep.push(e); continue; }
+    if (!fs.existsSync(dir) || rmProfile(dir)) n++; else keep.push(e);
+  }
+  ledger(() => keep);
+  if (n) log(`removed ${n} leftover browser profile(s) from a previous session`);
+  return n;
+}
+
+/**
+ * Boot-time cleanup of Chromium processes left behind by a Replayr process that died hard
+ * (SIGKILL, TerminateProcess, power loss). A process is only touched when its command line carries
+ * `--replayr-owner=<pid>` AND that pid is no longer alive. Its Playwright temp profile is removed
+ * only if it sits directly in the OS temp dir with Playwright's own name prefix. Returns the pids killed.
+ */
+async function sweepOrphanBrowsers(log = () => {}) {
+  const killed = [];
+  try { sweepProfileLedger(log); } catch { /* housekeeping */ }
+  for (const { pid, commandLine } of await listMarkedProcesses()) {
+    const m = commandLine.match(/--replayr-owner=(\d+)/);
+    if (!m || pidAlive(Number(m[1]))) continue;
+    try {
+      if (process.platform === 'win32') require('child_process').execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      else process.kill(pid, 'SIGKILL');
+      killed.push(pid);
+    } catch { /* already gone */ }
+    const ud = commandLine.match(/--user-data-dir=(?:"([^"]+)"|(\S+))/);
+    const dir = ownedProfileDir(ud && (ud[1] || ud[2]));
+    if (dir) setTimeout(() => releaseProfile(dir), 1000).unref();
+    log(`swept orphaned browser pid ${pid} (owner ${m[1]} is gone)`);
+  }
+  return killed;
+}
+
+function kindOf(def) { return (def && def.kind) || 'local'; }
+function isProtectedDef(def) { return !!def && (def.protected === true || def.kind === 'production' || def.remote === true); }
+function originOf(u) { try { return new URL(u).origin; } catch { return null; } }
+function trimSlash(p) { return String(p || '').replace(/\/+$/, ''); }
+
+/** Origins of every environment that must never be touched by a replay aimed somewhere else. */
+function protectedOriginsFor(recordedDef, targetBase) {
+  const out = new Set();
+  const add = (def) => { const o = def && originOf(def.baseUrl); if (o && isProtectedDef(def)) out.add(o); };
+  try {
+    if (typeof targets.listEnvironments === 'function') (targets.listEnvironments() || []).forEach(add);
+    else Object.values(config.apps || {}).forEach(add);
+  } catch { /* fall through with whatever was collected */ }
+  add(recordedDef);
+  out.delete(originOf(targetBase));
+  return out;
+}
+
+/** Rewrite an absolute URL that lives on the RECORDED environment so it points at the target. */
+function rewriteUrl(url, ctx) {
+  if (!ctx.crossEnv || !ctx.recordedBase) return url;
+  let u; let rb; let tb;
+  try { u = new URL(url); rb = new URL(ctx.recordedBase); tb = new URL(ctx.baseUrl); } catch { return url; }
+  if (!/^https?:$/.test(u.protocol) || u.origin !== rb.origin) return url;
+  const rbPath = trimSlash(rb.pathname);
+  const tbPath = trimSlash(tb.pathname);
+  const p = u.pathname;
+  let out;
+  if (!rbPath || p === rbPath || p.startsWith(rbPath + '/')) out = tb.origin + tbPath + p.slice(rbPath.length);   // origin + base path
+  else out = tb.origin + p;                                                                                       // origin only
+  const rewritten = out + u.search + u.hash;
+  const from = u.origin + u.pathname;
+  if (ctx.urlRewrites.length < 50 && !ctx.urlRewrites.some((r) => r.from === from && r.to === out)) ctx.urlRewrites.push({ from, to: out });
+  return rewritten;
+}
+
+function refuseProtected(url, ctx) {
+  if (!ctx.crossEnv) return;
+  const origin = originOf(url);
+  if (origin && origin !== originOf(ctx.baseUrl) && ctx.protectedOrigins.has(origin)) {
+    const e = new Error(`Refusing to navigate to protected environment ${origin} during a replay against ${ctx.targetLabel}`);
+    e.reason = 'step_failed';
+    throw e;
+  }
+}
+
+/** Credentials that show up in console output must not travel into run evidence. */
+const CRED_KEY = /(pass(?:word|wd|phrase)?|secret|api[-_ ]?key|token|otp|authorization|credential|session|sig(?:nature)?)/i;
+function redactCreds(text) {
+  let s = String(text == null ? '' : text);
+  s = s.replace(/\bBearer\s+[A-Za-z0-9._~+\/=-]+/gi, 'Bearer [redacted]');
+  s = s.replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g, '[redacted jwt]');
+  s = s.replace(new RegExp(`(["']?${CRED_KEY.source}["']?\\s*[:=]\\s*["']?)([^\\s"'&,;}]+)`, 'gi'), '$1[redacted]');
+  return s;
+}
+
+function stopError() { const e = new Error('The run was stopped'); e.name = 'RunStopped'; return e; }
+
+function isExpect(step) { return !!step && typeof step.type === 'string' && step.type.startsWith('expect'); }
+
+/** Failure -> { status, reason } per the run result taxonomy. */
+function classify(e, step) {
+  if (e && e.reason) return { status: e.reason === 'app_unreachable' || e.reason === 'browser_error' ? 'error' : 'failed', reason: e.reason };
+  if (e && e.name === 'ResolutionError') {
+    const attempts = e.attempts || [];
+    const ambiguous = attempts.some((a) => a.matches > 1) && !attempts.some((a) => a.matches === 1 && a.rejected);
+    return { status: 'failed', reason: ambiguous ? 'element_ambiguous' : 'element_not_found' };
+  }
+  const msg = String((e && e.message) || e);
+  if (/Target (page, context or browser )?(has been )?closed|browser has been closed|Browser closed|has been disconnected|Browser.*disconnected|page has been closed/i.test(msg)) return { status: 'error', reason: 'browser_error' };
+  if (step && (step.type === 'navigate' || step.type === 'openPage') && /net::ERR_|ECONNREFUSED/.test(msg)) return { status: 'error', reason: 'app_unreachable' };
+  if (isExpect(step)) return { status: 'failed', reason: 'assertion_failed' };
+  return { status: 'failed', reason: 'step_failed' };
+}
+
+function firstLine(s) { return String(s || '').split('\n')[0].slice(0, 300); }
 
 /**
  * @param test        a test as stored by storage.js
- * @param options     { headed, onProgress(progress), log(line) }
+ * @param options     { app, headed, onProgress(progress), log(line), signal }
  * @returns result    also written to the run folder
  */
-async function runTest(test, { app: appOverride, headed = config.headedRun, onProgress = () => {}, log = () => {} } = {}) {
-  const recordedApp = (test.target && test.target.app) || config.defaultApp;
-  const app = appOverride || recordedApp;
-  const def = config.apps[app];
-  if (!def) throw storage.httpError(400, `Unknown app "${app}"`);
+async function runTest(test, options = {}) {
+  const run = { result: null, dir: null };
+  const log = options.log || (() => {});
+  try {
+    return await runTestInner(test, options, run);
+  } catch (e) {
+    // Anything thrown after the result exists must still leave a finished record behind.
+    if (!run.result || run.result.finishedAt) throw e;
+    return finish(run.result, 'error', 'internal_error', `The runner hit an unexpected error: ${firstLine(cleanError(e))}`, cleanError(e), run.dir, log);
+  }
+}
+
+async function runTestInner(test, { app: appOverride, headed = config.headedRun, onProgress = () => {}, log = () => {}, signal } = {}, run) {
+  const storedApp = (test.target && test.target.app) || config.defaultApp;
+  // Canonical keys on both sides, so a URL typed to match a configured app is not "cross-env".
+  let recordedDef = null;
+  try { recordedDef = targets.resolve(storedApp); } catch (e) { recordedDef = null; }
+  const recordedApp = recordedDef ? recordedDef.key : storedApp;
+  const def = targets.resolve(appOverride || recordedApp);
+  if (!def) throw storage.httpError(400, `Unknown app "${appOverride || recordedApp}"`);
+  const app = def.key;
   const baseUrl = def.baseUrl;
   // Replaying somewhere other than where it was recorded is a supported thing to do, but the
   // result must SAY so - a pass against QA1 is not evidence about the code on this machine, and
@@ -40,6 +277,7 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
   const crossEnv = app !== recordedApp;
   const runId = storage.newRunId();
   const dir = storage.runDir(test.id, runId);
+  run.dir = dir;
   const startedAt = new Date();
   const total = test.steps.length;
 
@@ -51,8 +289,12 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
     recordedApp,
     crossEnv,
     baseUrl,
+    target: { key: app, label: def.label, baseUrl, kind: kindOf(def) },
+    recordedOn: recordedDef ? { key: recordedDef.key, label: recordedDef.label, baseUrl: recordedDef.baseUrl } : null,
     headed,
-    status: 'running',        // running · passed · failed · blocked
+    status: 'running',        // running · passed · failed · blocked · error · cancelled · inconclusive
+    reason: null,
+    summary: null,
     startedAt: startedAt.toISOString(),
     finishedAt: null,
     durationMs: 0,
@@ -64,30 +306,115 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
     screenshot: null,
     consoleErrors: [],
     networkErrors: [],
+    urlRewrites: [],
+    dialogs: [],
+    assertions: { total: test.steps.filter(isExpect).length, passed: 0, failed: 0 },
     notes: [],
   };
+  run.result = result;
   const progress = (extra) => onProgress({ runId, testId: test.id, status: result.status, total, steps: result.steps, ...extra });
-
-  // ── preflight: app answering? login valid?
-  progress({ phase: 'preflight' });
-  const ready = await waitForApp(baseUrl, config.appReadyTimeoutMs);
-  if (!ready) return finish(result, 'blocked', `${def.label} is not answering at ${baseUrl}. Is the stack up (or ng serve still recompiling)?`, dir, log);
-  const session = await auth.ensureSession(app, { log });
-  if (!['valid', 'renewed', 'no-auth-needed'].includes(session.status)) {
-    return finish(result, 'blocked', `Cannot run while logged out: ${session.message}`, dir, log);
-  }
-  if (session.status === 'renewed') result.notes.push('Login session was expired and has been renewed.');
-  if (crossEnv) {
-    const from = (config.apps[recordedApp] && config.apps[recordedApp].label) || recordedApp;
-    result.notes.push(`Recorded against ${from}, replayed against ${def.label} (${baseUrl}). Steps follow {{baseUrl}}, but the two environments may not hold the same data.`);
-    log(`run: cross-environment replay - recorded on ${recordedApp}, running on ${app}`);
+  if (typeof storage.writeRunStart === 'function') {
+    try { storage.writeRunStart(test.id, runId, result); } catch (e) { log(`run: could not write the start record (${firstLine(cleanError(e))})`); }
   }
 
-  // ── fresh browser
-  const browser = await chromium.launch({ headless: !headed });
-  const pages = [];
+  // ── stop control: cancel from the caller, or the run-level timeout
+  const stopper = new AbortController();
+  let stopReason = null;
+  const stop = (why) => { if (!stopReason) { stopReason = why; stopper.abort(); } };
+  const onAbort = () => stop('cancelled');
+  if (signal) { if (signal.aborted) stop('cancelled'); else signal.addEventListener('abort', onAbort, { once: true }); }
+  const runTimeoutMs = Number(test.settings && test.settings.runTimeoutMs) || Number(config.runTimeoutMs) || DEFAULT_RUN_TIMEOUT_MS;
+  const timer = setTimeout(() => stop('timeout'), runTimeoutMs);
+  if (timer.unref) timer.unref();
+  const aborted = new Promise((res) => { if (stopper.signal.aborted) res(); else stopper.signal.addEventListener('abort', res, { once: true }); });
+  const raceStop = (p) => { p.catch(() => {}); return Promise.race([p, aborted.then(() => { throw stopError(); })]); };
+
+  const stoppedFinish = () => {
+    if (stopReason === 'timeout') {
+      return finish(result, 'error', 'timeout', `The run exceeded its ${Math.round(runTimeoutMs / 1000)} s time limit and was stopped.`, `Run timed out after ${runTimeoutMs} ms`, dir, log);
+    }
+    if (stopReason === 'browser_crash') {
+      return finish(result, 'error', 'browser_error', 'The browser stopped unexpectedly.', 'The browser process exited or lost its connection while the run was in progress.', dir, log);
+    }
+    return finish(result, 'cancelled', 'cancelled', 'The run was cancelled before it finished.', null, dir, log);
+  };
+
+  let browser = null;
+  let closingByUs = false;
+  let closing = null;
+  let closeBrowser = () => Promise.resolve();
+  let proxy = null;
+  // What this replay may reach (see src/urlsafety.js). Protected environments other than the target
+  // are ALWAYS off-limits — not only on a cross-environment run — and cloud metadata never is reachable.
+  const policy = {
+    mode: 'replay',
+    target: { baseUrl, kind: def.kind },
+    protectedOrigins: [...protectedOriginsFor(recordedDef, baseUrl)],
+    allowOrigins: def.allowOrigins || [],
+  };
   try {
-    const context = await browser.newContext({ ...auth.storageStateOption(app), viewport: config.viewport });
+    // ── preflight: app answering? login valid?
+    progress({ phase: 'preflight' });
+    const probeResult = await raceStop(waitForApp(baseUrl, config.appReadyTimeoutMs, stopper.signal));
+    if (probeResult && probeResult.blocked) {
+      return finish(result, 'blocked', 'app_unreachable', `Replayr refused to contact ${baseUrl}, so the test did not run.`,
+        `Refused by the network guard: ${probeResult.reason}`, dir, log);
+    }
+    const ready = probeResult === true;
+    if (!ready) {
+      if (stopReason) { appendNotRun(result, test, 0); return stoppedFinish(); }
+      return finish(result, 'blocked', 'app_unreachable', `${def.label} is not answering at ${baseUrl}, so the test did not run.`,
+        `${def.label} is not answering at ${baseUrl}. Is the stack up (or ng serve still recompiling)?`, dir, log);
+    }
+    const session = await raceStop(auth.ensureSession(app, { log }));
+    if (!['valid', 'renewed', 'no-auth-needed'].includes(session.status)) {
+      return finish(result, 'blocked', 'auth_failed', 'Could not sign in, so the test did not run.', `Cannot run while logged out: ${session.message}`, dir, log);
+    }
+    if (session.status === 'renewed') result.notes.push('Login session was expired and has been renewed.');
+    if (crossEnv) {
+      const from = (recordedDef && recordedDef.label) || recordedApp;
+      result.notes.push(`Recorded against ${from}, replayed against ${def.label} (${baseUrl}). Steps follow {{baseUrl}}, but the two environments may not hold the same data.`);
+      log(`run: cross-environment replay - recorded on ${recordedApp}, running on ${app}`);
+    }
+
+    // ── fresh browser
+    try {
+      browser = await raceStop(launchBrowser(headed, () => !!stopReason));
+    } catch (e) {
+      if (stopReason) throw e;
+      return finish(result, 'error', 'browser_error', 'The browser could not be started, so the test did not run.', `Chromium failed to launch: ${firstLine(cleanError(e))}`, dir, log);
+    }
+    browsers.add(browser);
+    browser.on('disconnected', () => {
+      browsers.delete(browser); pids.delete(browser);
+      // Nobody asked for this: the browser died (crash, OOM, killed). Stop the run now rather than
+      // letting a `wait` step or a step timeout run out against a dead browser.
+      if (!closingByUs && !closingAll_) stop('browser_crash');
+    });
+    // One shared close: a second concurrent browser.close() returns at once, which would let the run report
+    // 'done' while the browser process is still shutting down.
+    closeBrowser = () => { closingByUs = true; if (!closing) closing = browser.close().catch(() => {}); return closing; };
+    // Playwright's Browser does not expose its pid; learn it from the OS (async: the lookup spawns a helper) so a
+    // shutdown, a test or a diagnosis can name the process. Purely informational.
+    const launched = browser;
+    findBrowserPid().then(({ pid, dir }) => {
+      if (!pid || !browsers.has(launched)) return;
+      pids.set(launched, pid); result.browserPid = pid; log('run: browser pid ' + pid);
+      if (dir) { profileOf.set(launched, dir); ledger((l) => [...l.filter((e) => e.dir !== dir), { dir, owner: process.pid }]); }
+    }).catch(() => {});
+    if (stopper.signal.aborted) closeBrowser(); else stopper.signal.addEventListener('abort', closeBrowser, { once: true });
+
+    const pages = [];
+    // NETWORK GUARD. Two layers, because Playwright's request routing never sees redirect hops:
+    // a local forwarding proxy enforces the policy on every connection the browser opens
+    // (redirects, websockets, DNS re-checked at connect time), and a route guard records and aborts
+    // what it can see earlier. Service workers are blocked so they cannot fetch around both.
+    proxy = await raceStop(urlsafety.startGuardProxy(policy));
+    const context = await raceStop(browser.newContext({
+      ...auth.storageStateOption(app), ...proxy.contextOptions, serviceWorkers: 'block', viewport: config.viewport,
+    }));
+    const guard = await urlsafety.installNetworkGuard(context, policy, proxy);
+    result.blockedRequests = guard.blocked;
 
     // The identity engine has to be present at replay too: the resolver reads each candidate
     // element's identity back out of the page to prove it is the one that was recorded. Without
@@ -97,7 +424,7 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
     // there: `context._exposeConsoleApi()` on a version that dropped it throws a TypeError
     // SYNCHRONOUSLY, which the trailing `.catch()` never sees, and the whole run dies before the
     // first step on a browser upgrade.
-    if (typeof context._exposeConsoleApi === 'function') await context._exposeConsoleApi().catch(() => {});
+    await Promise.resolve().then(() => pw.exposeConsoleApi(context)).catch(() => {});
     // If the library cannot be injected the resolver still works, but it can no longer read an
     // element's identity back to check it is the recorded one — it accepts on uniqueness alone.
     // That is a weaker guarantee than the report otherwise implies, so say so rather than
@@ -109,10 +436,33 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
     // The timestamp is what lets a poll or an open stream be told apart from this step's work.
     const inflight = new WeakMap();
 
+    // `acting` is the element the CURRENT step resolved, kept so a failure can be drawn on the
+    // evidence screenshot. It is deliberately not on `entry`, which is serialised to JSON.
+    const ctx = {
+      context, pages, baseUrl, test, inflight, headed, acting: null, step: null,
+      crossEnv, recordedBase: recordedDef ? recordedDef.baseUrl : null, urlRewrites: result.urlRewrites,
+      protectedOrigins: crossEnv ? protectedOriginsFor(recordedDef, baseUrl) : new Set(),
+      targetLabel: def.label || baseUrl,
+      policy,
+    };
+
     const attach = (p) => {
       if (pages.includes(p)) return;
       pages.push(p);
       inflight.set(p, new Map());
+      // Never leave a dialog unhandled: an open dialog freezes the page and the step with it.
+      p.on('dialog', async (d) => {
+        const st = ctx.step;
+        const type = d.type();
+        const dismiss = !!(st && st.dialog === 'dismiss');
+        if (result.dialogs.length < 100) {
+          result.dialogs.push({ stepId: st ? st.id : null, type, message: redactCreds(d.message()).slice(0, 500), action: dismiss ? 'dismiss' : 'accept' });
+        }
+        try {
+          if (dismiss) await d.dismiss();
+          else await d.accept(type === 'prompt' ? String((st && st.dialogText) || '') : undefined);
+        } catch { /* the page went away */ }
+      });
       p.on('request', (r) => {
         const t = r.resourceType();
         if (t !== 'xhr' && t !== 'fetch') return;
@@ -124,7 +474,7 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
       p.on('requestfailed', settled);
       p.on('console', (m) => {
         if (m.type() === 'error' && result.consoleErrors.length < 200) {
-          result.consoleErrors.push({ at: new Date().toISOString(), step: result.steps.length + 1, text: m.text().slice(0, 1000) });
+          result.consoleErrors.push({ at: new Date().toISOString(), step: result.steps.length + 1, text: redactCreds(m.text().slice(0, 1000)) });
         }
       });
       p.on('requestfailed', (r) => {
@@ -134,15 +484,15 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
         if (r.status() >= 400 && result.networkErrors.length < 200) result.networkErrors.push({ at: new Date().toISOString(), step: result.steps.length + 1, url: safeUrl(r.url()), status: r.status() });
       });
     };
+    context.on('close', () => { if (!closingByUs && !closingAll_) stop('browser_crash'); });
     context.on('page', attach);
-    const first = await context.newPage();
+    const first = await raceStop(context.newPage());
     attach(first);
 
-    // `acting` is the element the CURRENT step resolved, kept so a failure can be drawn on the
-    // evidence screenshot. It is deliberately not on `entry`, which is serialised to JSON.
-    const ctx = { context, pages, baseUrl, test, inflight, headed, acting: null };
-
+    let failure = null;      // { status, reason, summary }
+    let stoppedAt = total;   // index of the first step that did not complete
     for (let i = 0; i < total; i++) {
+      if (stopReason || stopper.signal.aborted) { stoppedAt = i; break; }
       const step = test.steps[i];
       // `describe` quotes the value a step types; on a secret step that is a password on its
       // way into result.json. Same treatment as the errors below.
@@ -150,18 +500,28 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
       result.steps.push(entry);
       progress({ phase: 'step', current: i + 1 });
       ctx.acting = null;
+      ctx.step = step;
       const t0 = Date.now();
       try {
-        const outcome = await performStep(step, ctx, entry);
+        const outcome = await raceStop(performStep(step, ctx, entry));
         entry.status = outcome && outcome.skipped ? 'skipped' : 'passed';
         if (outcome && outcome.note) entry.note = outcome.note;
         entry.ms = Date.now() - t0;
         entry.url = steps.templateUrl(currentUrl(pages, step), baseUrl);
+        if (isExpect(step) && entry.status === 'passed') result.assertions.passed++;
       } catch (e) {
         entry.ms = Date.now() - t0;
+        if (stopReason) {
+          // The step did not fail; the run was stopped under it.
+          entry.status = 'not-run';
+          entry.note = stopReason === 'timeout' ? 'Stopped by the run time limit while this step was running.' : 'Cancelled while this step was running.';
+          stoppedAt = i + 1;
+          break;
+        }
         entry.status = 'failed';
         entry.error = redact(cleanError(e), step);
         entry.url = steps.templateUrl(currentUrl(pages, step), baseUrl);
+        if (isExpect(step)) result.assertions.failed++;
         // A resolution failure carries the whole attempt log. This is the difference between
         // "Element not found" and a report that says which strategies were tried and what each
         // one saw — see identity/resolver.js.
@@ -176,8 +536,18 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
         result.failedStep = i + 1;
         result.error = entry.error;
         result.url = currentUrl(pages, step);
+        const cls = classify(e, step);
+        const lead = {
+          assertion_failed: 'The expected behaviour was not met',
+          element_not_found: 'The element could not be found',
+          element_ambiguous: 'The element could not be uniquely identified',
+          app_unreachable: 'The app could not be reached',
+          browser_error: 'The browser stopped unexpectedly',
+        }[cls.reason] || 'A step failed';
+        failure = { ...cls, summary: `${lead} at step ${i + 1} (${entry.text}): ${firstLine(entry.error)}` };
+        stoppedAt = i + 1;
         const page = pageFor(ctx, step, false);
-        if (page && !page.isClosed()) {
+        if (page && !page.isClosed() && cls.reason !== 'browser_error') {
           // The step is already lost, so nothing here can change its outcome — and a screenshot
           // that says WHICH element the runner was aiming at is worth far more than one that
           // leaves you comparing the picture with the step list. Only possible when the element
@@ -202,24 +572,67 @@ async function runTest(test, { app: appOverride, headed = config.headedRun, onPr
         break;
       }
     }
-    const failed = result.steps.some((s) => s.status === 'failed');
+    ctx.step = null;
     if (!result.url) result.url = currentUrl(pages, null);
-    return finish(result, failed ? 'failed' : 'passed', null, dir, log);
+    appendNotRun(result, test, stoppedAt);
+
+    if (stopReason) return stoppedFinish();
+    if (failure) return finish(result, failure.status, failure.reason, failure.summary, null, dir, log);
+    const skipped = result.steps.filter((s) => s.status === 'skipped').length;
+    if (skipped) {
+      return finish(result, 'inconclusive', 'steps_skipped', `${skipped} step(s) were skipped, so the result is not conclusive.`, null, dir, log);
+    }
+    if (result.assertions.passed === 0) {
+      return finish(result, 'inconclusive', 'no_assertions', 'Steps completed, but the test has no assertion, so the fix is not verified.', null, dir, log);
+    }
+    return finish(result, 'passed', 'assertions_passed', `All ${total} steps ran and ${result.assertions.passed} assertion(s) passed: the expected behaviour was verified.`, null, dir, log);
+  } catch (e) {
+    if (stopReason) { appendNotRun(result, test, result.steps.length); return stoppedFinish(); }
+    if (/Target (page, context or browser )?(has been )?closed|browser has been closed/i.test(String((e && e.message) || e))) {
+      return finish(result, 'error', 'browser_error', 'The browser stopped unexpectedly.', cleanError(e), dir, log);
+    }
+    throw e;
   } finally {
-    await browser.close().catch(() => {});
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+    if (browser) {
+      browsers.delete(browser); pids.delete(browser); closingByUs = true;
+      await closeBrowser();
+      // A browser that crashed leaves its temp profile behind (Playwright only removes it on a clean close).
+      const prof = profileOf.get(browser);
+      profileOf.delete(browser);
+      if (prof) { await sleep(300); releaseProfile(prof); }
+    }
+    if (proxy) await proxy.close().catch(() => {});
   }
 }
 
-function finish(result, status, error, dir, log) {
+/** After a stop, list the steps that never ran so a report shows the whole test. */
+function appendNotRun(result, test, fromIndex) {
+  for (let j = Math.max(fromIndex, result.steps.length); j < test.steps.length; j++) {
+    const s = test.steps[j];
+    result.steps.push({ index: j + 1, id: s.id, type: s.type, text: redact(steps.describe(s), s), status: 'not-run', ms: 0, url: null });
+  }
+}
+
+function finish(result, status, reason, summary, error, dir, log) {
   result.status = status;
+  result.reason = reason;
+  result.summary = summary;
+  const nBlocked = Array.isArray(result.blockedRequests) ? result.blockedRequests.length : 0;
+  if (nBlocked && Array.isArray(result.notes)) {
+    result.notes.push(`${nBlocked} request${nBlocked === 1 ? ' was' : 's were'} blocked by the network guard (see blockedRequests in result.json).`);
+  }
   if (error) result.error = error;
   result.finishedAt = new Date().toISOString();
   result.durationMs = new Date(result.finishedAt) - new Date(result.startedAt);
   if (result.consoleErrors.length) {
-    fs.writeFileSync(path.join(dir, 'console.log'), result.consoleErrors.map((c) => `[step ${c.step}] ${c.at} ${c.text}`).join('\n') + '\n');
+    try {
+      fs.writeFileSync(path.join(dir, 'console.log'), result.consoleErrors.map((c) => `[step ${c.step}] ${c.at} ${redactCreds(c.text)}`).join('\n') + '\n');
+    } catch { /* evidence only: never lose the run record over it */ }
   }
   storage.saveRun(result.testId, result);
-  log(`run ${result.id}: ${status}${result.failedStep ? ` at step ${result.failedStep}` : ''} (${result.durationMs} ms)`);
+  log(`run ${result.id}: ${status}/${reason}${result.failedStep ? ` at step ${result.failedStep}` : ''} (${result.durationMs} ms)`);
   return result;
 }
 
@@ -279,17 +692,28 @@ async function performStep(step, ctx, entry) {
       else if (entry && !watched && cap > 0) addNote(entry, 'Nothing was in flight.');
       return;
     }
-    case 'navigate':
-      await page.goto(steps.resolveUrl(step.url, ctx.baseUrl), { timeout: config.navigationTimeoutMs, waitUntil: 'load' });
-      // `load` fires when the document is done, which for a single-page app is before it has
-      // fetched anything it means to show. This is the step that most needs the wait.
+    case 'navigate': {
+      const dest = rewriteUrl(steps.resolveUrl(step.url, ctx.baseUrl), ctx);
+      refuseProtected(dest, ctx);
+      if (ctx.policy) {
+        const verdict = await urlsafety.checkDestinationResolved(dest, ctx.policy);
+        if (!verdict.ok) {
+          const e = new Error(`Blocked navigation to ${String(dest).split('?')[0]}: ${verdict.reason}`);
+          e.reason = 'step_failed';
+          throw e;
+        }
+      }
+      await page.goto(dest, { timeout: config.navigationTimeoutMs, waitUntil: 'load' });
       return settle(page, step, ctx, entry);
+    }
     case 'closePage':
       await page.close();
       return;
-    case 'expectUrl':
-      await page.waitForURL((u) => steps.samePath(u.toString(), steps.resolveUrl(step.url, ctx.baseUrl)), { timeout });
+    case 'expectUrl': {
+      const want = rewriteUrl(steps.resolveUrl(step.url, ctx.baseUrl), ctx);
+      await page.waitForURL((u) => steps.samePath(u.toString(), want, { matchQuery: !!step.matchQuery }), { timeout });
       return settle(page, step, ctx, entry);
+    }
     case 'press':
       // A key pressed with nothing focused was recorded without a target; replay it the same way.
       if (!steps.isIdentityTarget(step.target) && !steps.legacyTargetOf(step) && !step.selector && !step.fallbackSelector) {
@@ -305,6 +729,8 @@ async function performStep(step, ctx, entry) {
   // as "Step "flibble" has no target", which sends a developer looking for a missing locator when
   // the real problem is a step this version of the runner cannot perform at all.
   if (!ELEMENT_STEPS.has(step.type)) throw new Error(`Unknown step type "${step.type}"`);
+
+  if (step.type === 'expectHidden' || step.type === 'expectCount') return listAssertion(page, step, timeout, entry);
 
   const loc = await resolveTarget(page, step, timeout, entry);
   ctx.acting = { page, locator: loc };
@@ -345,8 +771,11 @@ async function performStep(step, ctx, entry) {
       await loc.first().waitFor({ state: 'visible', timeout });
       return;
     case 'expectText': {
-      const needle = step.substring === false ? new RegExp(`^\\s*${escapeRegExp(step.text)}\\s*$`) : step.text;
-      await loc.filter({ hasText: needle }).first().waitFor({ state: 'attached', timeout });
+      let needle;
+      if (step.regex) needle = new RegExp(step.regex);
+      else if (step.substring === false || step.exact) needle = new RegExp(`^\\s*${escapeRegExp(step.text)}\\s*$`);
+      else needle = step.text;
+      await loc.filter({ hasText: needle }).first().waitFor({ state: 'visible', timeout });
       return;
     }
     case 'expectValue':
@@ -475,6 +904,39 @@ async function resolveTarget(page, step, timeout, entry) {
 
   if (entry) entry.resolution = { strategy: 'legacy', locator: step.selector || step.fallbackSelector || null, confidence: null, attempts: [] };
   return steps.locatorFor(root, step);
+}
+
+/**
+ * The locators an assertion about "how many" or "is it gone" is made with. Unlike an action, these
+ * must not insist on finding exactly one element, so the identity resolver (which refuses anything
+ * but one) is bypassed and the saved SEMANTIC candidates are used directly, best first.
+ */
+function locatorsForCounting(root, step) {
+  if (steps.isIdentityTarget(step.target)) {
+    const t = step.target;
+    const list = (t.candidates && t.candidates.length ? t.candidates : (t.fingerprint ? identity.candidatesFor(t.fingerprint) : []))
+      .filter((c) => c && c.strategy && !(c.matches === 0 && c.rejected));
+    const semantic = list.filter((c) => !isPositionalCandidate(c)).sort((a, b) => (b.score || 0) - (a.score || 0));
+    const out = [];
+    for (const c of (semantic.length ? semantic : list)) { try { out.push(buildLocator(root, c)); } catch { /* skip */ } }
+    if (out.length) return out;
+  }
+  return [steps.locatorFor(root, step)];
+}
+
+async function listAssertion(page, step, timeout, entry) {
+  const root = await frameFor(page, step, timeout);
+  const locs = locatorsForCounting(root, step);
+  if (entry) entry.resolution = { strategy: 'count', locator: String(locs.length) + ' candidate locator(s)', confidence: null, attempts: [] };
+  if (step.type === 'expectCount') {
+    await poll(async () => (await locs[0].count()) === step.count, timeout, `the number of matches is not ${step.count}`);
+    return;
+  }
+  // expectHidden: nothing may be visible through any of the candidate locators. Absent counts.
+  await poll(async () => {
+    for (const l of locs) if (await l.first().isVisible()) return false;
+    return true;
+  }, timeout, 'the element is still visible');
 }
 
 /** When a step was recorded inside an iframe, act inside that frame rather than the top document. */
@@ -631,7 +1093,7 @@ const MAX_XHR_WAIT_MS = 60_000;
  */
 const ELEMENT_STEPS = new Set([
   'click', 'dblclick', 'hover', 'fill', 'press', 'check', 'uncheck', 'select', 'upload',
-  'expectVisible', 'expectText', 'expectValue', 'expectChecked', 'expectSnapshot',
+  'expectVisible', 'expectText', 'expectValue', 'expectChecked', 'expectSnapshot', 'expectHidden', 'expectCount',
 ]);
 
 /** Notes accumulate: a capped wait and a busy network are two separate things to know. */
@@ -668,14 +1130,19 @@ async function poll(check, timeout, failText) {
   throw new Error(`Timeout ${timeout}ms: ${failText}${lastErr ? ` (${cleanError(lastErr)})` : ''}`);
 }
 
-async function waitForApp(baseUrl, timeout) {
+/**
+ * true when the app answers; false when it never did; `{ blocked, reason }` when the network guard
+ * refuses the address (cloud metadata, a name that resolves somewhere it must not). The probe never
+ * follows redirects and checks DNS inside the socket's own lookup.
+ */
+async function waitForApp(baseUrl, timeout, signal) {
   const end = Date.now() + timeout;
-  while (Date.now() < end) {
-    try {
-      const res = await fetch(baseUrl, { redirect: 'manual', signal: AbortSignal.timeout(5000) });
-      if (res.status > 0) return true;
-    } catch { /* not yet */ }
-    await new Promise((r) => setTimeout(r, 1000));
+  const policy = { mode: 'server-fetch', target: { baseUrl } };
+  while (Date.now() < end && !(signal && signal.aborted)) {
+    const r = await urlsafety.probe(baseUrl, policy, { timeoutMs: 5000 });
+    if (r.ok) return true;
+    if (r.blocked) return { blocked: true, reason: r.reason };
+    await new Promise((res) => setTimeout(res, 1000));
   }
   return false;
 }
@@ -741,4 +1208,7 @@ function cleanError(e) {
   return keep.join('\n').slice(0, 1500);
 }
 
-module.exports = { runTest };
+/** Open browsers (diagnostics and tests only). */
+function activeBrowsers() { return [...browsers]; }
+
+module.exports = { runTest, closeAll, browserPids, activeBrowsers, sweepOrphanBrowsers, OWNER_FLAG };
