@@ -1,0 +1,30 @@
+<!--
+  labels (AFTER)
+  Same associations, reshuffled markup: the wrapping label became a for= label and
+  vice versa. Names must be identical either way, which is the whole point of
+  naming by label rather than by structure.
+-->
+<title>Label associations — after</title>
+<style>body{font:14px system-ui;margin:24px}.field{margin:0 0 10px}</style>
+<h2 id="formHeading">Contact details</h2>
+<form aria-label="Contact Form">
+  <div class="field">
+    <label>Email address
+      <input class="x-expect-for" name="email" type="email">
+    </label>
+  </div>
+  <div class="field">
+    <label for="phoneNumber">Phone number</label>
+    <input class="x-expect-wrap" id="phoneNumber" name="phone" type="tel">
+  </div>
+  <div class="field">
+    <span id="lblCurrency">Currency</span> <span id="lblCode">code</span>
+    <input class="x-expect-labelledby" name="currency" type="text" aria-labelledby="lblCurrency lblCode">
+  </div>
+  <div class="field">
+    <input class="x-expect-placeholder" name="search" type="text" placeholder="Search customers">
+  </div>
+  <img class="x-expect-img" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="Company logo" width="16" height="16">
+  <a class="x-expect-link" href="/customers/help">Contact support</a>
+  <input class="x-expect-submit" type="submit" value="Send message">
+</form>

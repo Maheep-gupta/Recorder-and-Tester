@@ -1,0 +1,17 @@
+<!--
+  nesting-change (BEFORE)
+  Structure is div > div > button. The AFTER page rewraps the same button as
+  section > article > div > button. Accessible name and container name are
+  unchanged, so role+name (scoped to "Customer Details") must survive; every
+  positional selector recorded here must NOT.
+-->
+<title>Nesting change — before</title>
+<style>body{font:14px system-ui;margin:24px}</style>
+<h1>Customers</h1>
+<div id="app">
+  <div role="region" aria-label="Customer Details">
+    <div class="body">
+      <button class="x-expect">Save Customer</button>
+    </div>
+  </div>
+</div>

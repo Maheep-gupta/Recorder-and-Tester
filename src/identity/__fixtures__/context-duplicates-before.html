@@ -1,0 +1,25 @@
+<!--
+  context-duplicates (BEFORE)
+  Three sections, each an aria-labelled region, each holding a byte-identical
+  <button>Save</button>. The recorded target is the FIRST one (Customer Details).
+  role+name alone is ambiguous here (sameRoleAndName === 3); only a candidate
+  scoped to the "Customer Details" region can be trusted.
+-->
+<title>Duplicate Save buttons — before</title>
+<style>body{font:14px system-ui;margin:24px}section{border:1px solid #ddd;padding:12px;margin:0 0 12px;max-width:420px}</style>
+<h1>Order intake</h1>
+<section aria-label="Customer Details">
+  <h2>Customer Details</h2>
+  <input aria-label="Customer name" value="Acme Corp">
+  <button class="x-expect">Save</button>
+</section>
+<section aria-label="Address Details">
+  <h2>Address Details</h2>
+  <input aria-label="Street" value="1 Mill Lane">
+  <button>Save</button>
+</section>
+<section aria-label="Order Details">
+  <h2>Order Details</h2>
+  <input aria-label="Order reference" value="PO-771">
+  <button>Save</button>
+</section>

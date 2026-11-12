@@ -1,0 +1,12 @@
+<!--
+  id-text-change (BEFORE)
+  No test id at all: the only strong signal is the hand-written id="saveCustomer".
+  The AFTER page shortens the label to "Save". role+name dies, the id must carry it.
+-->
+<title>Id + text change — before</title>
+<style>body{font:14px system-ui;margin:24px}</style>
+<h1>Customers</h1>
+<div class="panel">
+  <button class="x-expect" id="saveCustomer">Save Customer</button>
+  <button id="cancelCustomer">Cancel</button>
+</div>

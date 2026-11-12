@@ -1,0 +1,20 @@
+{
+  "name": "record-and-test",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Record a browser flow once, replay it later as a test, with screenshots and console logs when a step fails.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "selftest": "node scripts/selftest.js",
+    "test": "node tests/run-all.js",
+    "test:unit": "node tests/unit.test.js",
+    "test:dom": "node tests/fingerprint.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

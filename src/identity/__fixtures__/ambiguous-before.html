@@ -1,0 +1,17 @@
+<!--
+  ambiguous (BEFORE)
+  Three sibling <button>Save</button> inside ONE plain container, with no
+  aria-label, no id, no heading of their own and no test ids — nothing whatsoever
+  to tell them apart. The recorded target is the middle one.
+  The engine must SAY it is ambiguous (siblings.sameRoleAndName === 3) and must not
+  offer any meaningful strategy that resolves to exactly one element. Failing
+  safely is the correct outcome; guessing is not.
+-->
+<title>Ambiguous Save buttons — before</title>
+<style>body{font:14px system-ui;margin:24px}.toolbar{display:flex;gap:8px}</style>
+<h1>Drafts</h1>
+<div class="toolbar">
+  <button>Save</button>
+  <button class="x-expect">Save</button>
+  <button>Save</button>
+</div>

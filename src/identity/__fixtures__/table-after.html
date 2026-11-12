@@ -1,0 +1,26 @@
+<!--
+  table (AFTER)
+  Identical rows, reordered: Acme Corp is now LAST. Anything that resolved by row
+  index now edits the wrong customer. Resolution must follow the row content.
+-->
+<title>Customer table — after</title>
+<style>body{font:14px system-ui;margin:24px}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px;text-align:left}</style>
+<h1>Customers</h1>
+<table aria-label="Customers">
+  <caption>Customers</caption>
+  <thead><tr><th scope="col">Company</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Initech</td><td>Churned</td>
+      <td><button>Edit</button> <button>Delete</button></td>
+    </tr>
+    <tr>
+      <td>Globex</td><td>Active</td>
+      <td><button>Edit</button> <button>Delete</button></td>
+    </tr>
+    <tr>
+      <td>Acme Corp</td><td>Active</td>
+      <td><button class="x-expect">Edit</button> <button>Delete</button></td>
+    </tr>
+  </tbody>
+</table>

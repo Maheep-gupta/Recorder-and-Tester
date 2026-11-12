@@ -1,0 +1,29 @@
+<!--
+  table (BEFORE)
+  A repeated grid: every row has an identical Edit and Delete button, so the button
+  itself is ambiguous three times over. The recorded target is the Edit button in
+  the row whose first cell reads "Acme Corp".
+  The only honest way to name it is by its ROW CONTENT — never by row index, which
+  is exactly what the AFTER page invalidates by reordering the rows.
+-->
+<title>Customer table — before</title>
+<style>body{font:14px system-ui;margin:24px}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px;text-align:left}</style>
+<h1>Customers</h1>
+<table aria-label="Customers">
+  <caption>Customers</caption>
+  <thead><tr><th scope="col">Company</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Acme Corp</td><td>Active</td>
+      <td><button class="x-expect">Edit</button> <button>Delete</button></td>
+    </tr>
+    <tr>
+      <td>Globex</td><td>Active</td>
+      <td><button>Edit</button> <button>Delete</button></td>
+    </tr>
+    <tr>
+      <td>Initech</td><td>Churned</td>
+      <td><button>Edit</button> <button>Delete</button></td>
+    </tr>
+  </tbody>
+</table>

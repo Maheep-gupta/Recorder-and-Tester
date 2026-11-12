@@ -1,0 +1,34 @@
+<!--
+  labels (BEFORE)
+  The four ways a control gets its name in real applications:
+    1. <label for="..."> pointing at the control     -> nameSource "label"
+    2. a <label> wrapped around the control          -> nameSource "label"
+    3. aria-labelledby pointing at other elements    -> nameSource "aria-labelledby"
+    4. nothing but a placeholder                     -> nameSource "placeholder"
+  Plus a submit <input> whose name comes from its value, an <img> named by alt, a
+  heading and a link — the rest of the accessible-name table.
+-->
+<title>Label associations — before</title>
+<style>body{font:14px system-ui;margin:24px}.field{margin:0 0 10px}</style>
+<h2 id="formHeading">Contact details</h2>
+<form aria-label="Contact Form">
+  <div class="field">
+    <label for="emailAddress">Email address</label>
+    <input class="x-expect-for" id="emailAddress" name="email" type="email">
+  </div>
+  <div class="field">
+    <label>Phone number
+      <input class="x-expect-wrap" name="phone" type="tel">
+    </label>
+  </div>
+  <div class="field">
+    <span id="lblCurrency">Currency</span> <span id="lblCode">code</span>
+    <input class="x-expect-labelledby" name="currency" type="text" aria-labelledby="lblCurrency lblCode">
+  </div>
+  <div class="field">
+    <input class="x-expect-placeholder" name="search" type="text" placeholder="Search customers">
+  </div>
+  <img class="x-expect-img" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="Company logo" width="16" height="16">
+  <a class="x-expect-link" href="/customers/help">Contact support</a>
+  <input class="x-expect-submit" type="submit" value="Send message">
+</form>

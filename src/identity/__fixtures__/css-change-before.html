@@ -1,0 +1,14 @@
+<!--
+  css-change (BEFORE)
+  Identical semantics on both pages; only class names differ, including a CSS-in-JS
+  hashed class (css-1a2b3c). Nothing may be identified by a class, so resolution
+  must be completely unaffected — and the hashed class must show up in `volatile`,
+  never in `attrs`.
+-->
+<title>CSS change — before</title>
+<style>body{font:14px system-ui;margin:24px}</style>
+<h1>Customers</h1>
+<section aria-label="Customer Details" class="panel css-1a2b3c">
+  <h2>Customer Details</h2>
+  <button id="saveCustomer" class="btn primary css-1a2b3c x-expect">Save Customer</button>
+</section>

@@ -1,0 +1,19 @@
+<!--
+  nesting-change (AFTER)
+  Same button, same accessible name, same container name — three extra wrappers
+  and different element types around it.
+-->
+<title>Nesting change — after</title>
+<style>body{font:14px system-ui;margin:24px}</style>
+<h1>Customers</h1>
+<div id="app">
+  <section aria-label="Customer Details">
+    <article>
+      <div class="body">
+        <div class="row">
+          <button class="x-expect">Save Customer</button>
+        </div>
+      </div>
+    </article>
+  </section>
+</div>

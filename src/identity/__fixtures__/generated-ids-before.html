@@ -1,0 +1,41 @@
+<!--
+  generated-ids (BEFORE)
+  An Angular/Material-flavoured form where almost every id is minted at page load:
+  ss-0-listbox, mat-input-27, cdk-describedby-message-3, input-938492 and the React
+  useId shape :r7:. Exactly one id is hand-written: customerName. Every element also
+  carries an _ngcontent-ng-c123456 view-encapsulation marker, which must never be
+  read at all.
+  Expected behaviour: the generated ids land in `volatile` with a reason, only
+  customerName reaches `attrs`, and identification falls back to role+name / label.
+  Recorded targets: the customer-name input (x-expect) and the account-code input
+  (x-expect-2), whose own id is generated.
+-->
+<title>Generated ids — before</title>
+<style>body{font:14px system-ui;margin:24px}.field{margin:0 0 10px}label{display:block}</style>
+<h1>New customer</h1>
+<form id="customerForm" _ngcontent-ng-c123456 aria-label="Customer Form">
+  <div class="field" _ngcontent-ng-c123456>
+    <label for="customerName">Customer name</label>
+    <input _ngcontent-ng-c123456 class="x-expect" id="customerName" name="customerName" type="text">
+  </div>
+  <div class="field" _ngcontent-ng-c123456>
+    <label for="mat-input-27">Account code</label>
+    <input _ngcontent-ng-c123456 class="x-expect-2" id="mat-input-27" name="accountCode" type="text" aria-describedby="cdk-describedby-message-3">
+  </div>
+  <div id="cdk-describedby-message-3" _ngcontent-ng-c123456 hidden>Six digits, no spaces.</div>
+  <div class="field" _ngcontent-ng-c123456>
+    <label for="input-938492">Credit limit</label>
+    <input _ngcontent-ng-c123456 id="input-938492" name="creditLimit" type="number">
+  </div>
+  <div class="field" _ngcontent-ng-c123456>
+    <label for=":r7:">Region</label>
+    <select _ngcontent-ng-c123456 id=":r7:" name="region">
+      <option>EMEA</option>
+      <option>AMER</option>
+    </select>
+  </div>
+  <ul _ngcontent-ng-c123456 id="ss-0-listbox" role="listbox" aria-label="Suggestions">
+    <li role="option">Acme Corp</li>
+  </ul>
+  <button _ngcontent-ng-c123456 id="mat-button-14" type="submit">Create customer</button>
+</form>

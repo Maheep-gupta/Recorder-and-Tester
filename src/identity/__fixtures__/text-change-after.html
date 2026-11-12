@@ -1,0 +1,15 @@
+<!--
+  text-change (AFTER)
+  Same button, new wording and new class names. Must still resolve to the element
+  carrying class="x-expect".
+-->
+<title>Text change — after</title>
+<style>body{font:14px system-ui;margin:24px}section{border:1px solid #ddd;padding:16px;max-width:420px}.button-primary{padding:6px 14px}</style>
+<h1>Customers</h1>
+<section aria-label="Customer Details">
+  <h2>Customer Details</h2>
+  <p>Name: Acme Corp</p>
+  <button data-testid="save-customer" class="button-primary x-expect">Save</button>
+  <button class="button-ghost">Cancel</button>
+  <button class="Button_icon__b3c1 x-expect-close" aria-label="Close panel">×</button>
+</section>

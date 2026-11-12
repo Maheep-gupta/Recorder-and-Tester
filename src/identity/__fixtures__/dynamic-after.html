@@ -1,0 +1,23 @@
+<!--
+  dynamic (AFTER)
+  The late panel now takes 300ms and arrives inside an extra wrapper, and the
+  relative time in the profile name has aged from "1h" to "3h" — the exact failure
+  the volatile-name heuristic exists to predict.
+-->
+<title>Dynamic content — after</title>
+<style>body{font:14px system-ui;margin:24px}#late-panel{min-height:40px;border:1px dashed #ccc;padding:8px}</style>
+<h1>Dashboard</h1>
+<a class="x-expect-profile" id="profile-card" href="/people/maheep" aria-label="Dev's Profile Maheep Gupta 3h">MG</a>
+<canvas class="x-expect-canvas" id="sparkline" width="120" height="30"></canvas>
+<button class="x-expect-static" id="refreshDashboard">Refresh</button>
+<section id="late-panel" aria-label="Recent Activity"></section>
+<script>
+  setTimeout(function () {
+    var host = document.getElementById('late-panel');
+    host.innerHTML =
+      '<h2>Recent Activity</h2>' +
+      '<div class="row"><div class="cell">' +
+      '<button class="x-expect-late" data-testid="acknowledge-alert">Acknowledge</button>' +
+      '</div></div>';
+  }, 300);
+</script>

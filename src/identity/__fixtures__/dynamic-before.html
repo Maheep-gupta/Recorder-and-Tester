@@ -1,0 +1,27 @@
+<!--
+  dynamic (BEFORE)
+  Two things at once.
+  1. #late-panel is empty on load and is filled by an inline script 300ms later.
+     Replay must WAIT for the button rather than declare it missing — no arbitrary
+     sleeps are needed on the test side either, waiting for the selector is enough.
+  2. #profile-card carries an accessible name that contains a relative time
+     ("Dev's Profile Maheep Gupta 1h"). The volatile-name heuristic must flag it,
+     so that a locator is never built on a string that is wrong within the hour.
+  Also present: a <canvas> sparkline, which is a blind spot — a click there lands
+  on a drawing, not on an element.
+-->
+<title>Dynamic content — before</title>
+<style>body{font:14px system-ui;margin:24px}#late-panel{min-height:40px;border:1px dashed #ccc;padding:8px}</style>
+<h1>Dashboard</h1>
+<a class="x-expect-profile" id="profile-card" href="/people/maheep" aria-label="Dev's Profile Maheep Gupta 1h">MG</a>
+<canvas class="x-expect-canvas" id="sparkline" width="120" height="30"></canvas>
+<button class="x-expect-static" id="refreshDashboard">Refresh</button>
+<section id="late-panel" aria-label="Recent Activity"></section>
+<script>
+  setTimeout(function () {
+    var host = document.getElementById('late-panel');
+    host.innerHTML =
+      '<h2>Recent Activity</h2>' +
+      '<button class="x-expect-late" data-testid="acknowledge-alert">Acknowledge</button>';
+  }, 300);
+</script>

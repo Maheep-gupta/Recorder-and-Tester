@@ -1,0 +1,21 @@
+# dependencies
+node_modules/
+
+# secrets and machine-local settings: never commit
+*.local.env
+.env
+.auth/
+
+# your recorded tests and run evidence (screenshots, console logs)
+local-tests/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.log
+
+# Playwright output
+test-results/
+playwright-report/
+.idea/

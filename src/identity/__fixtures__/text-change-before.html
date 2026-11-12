@@ -1,0 +1,18 @@
+<!--
+  text-change (BEFORE)
+  Recorded target: the Save button, marked class="x-expect".
+  The AFTER page keeps data-testid="save-customer" but rewrites both the visible
+  label ("Save Customer" -> "Save") and the class list. A locator built on the test
+  contract, the id or role+name must survive; one built on text or class must not
+  be what carries the day.
+-->
+<title>Text change — before</title>
+<style>body{font:14px system-ui;margin:24px}section{border:1px solid #ddd;padding:16px;max-width:420px}.btn{padding:6px 14px}</style>
+<h1>Customers</h1>
+<section aria-label="Customer Details">
+  <h2>Customer Details</h2>
+  <p>Name: Acme Corp</p>
+  <button data-testid="save-customer" class="btn primary x-expect">Save Customer</button>
+  <button class="btn ghost">Cancel</button>
+  <button class="btn icon x-expect-close" aria-label="Close panel">×</button>
+</section>

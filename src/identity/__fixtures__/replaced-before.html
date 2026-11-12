@@ -1,0 +1,14 @@
+<!--
+  replaced (BEFORE)
+  The recorded button is the Save button. In the AFTER page a DIFFERENT button —
+  different test id, different name, opposite meaning — occupies exactly the same
+  DOM position. Resolution MUST fail. A positional fallback that happens to land
+  on the Delete button is the single most dangerous thing this engine can do.
+-->
+<title>Replaced element — before</title>
+<style>body{font:14px system-ui;margin:24px}</style>
+<h1>Customers</h1>
+<section aria-label="Customer Details">
+  <h2>Customer Details</h2>
+  <button class="x-expect" data-testid="save-customer">Save Customer</button>
+</section>

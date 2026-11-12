@@ -1,0 +1,29 @@
+<!--
+  context-duplicates (AFTER)
+  A FOURTH region ("Billing Details") has appeared, with its own identical Save
+  button, and it sits second in the document. Resolution must still land on the
+  Customer Details one and must never pick another.
+-->
+<title>Duplicate Save buttons — after</title>
+<style>body{font:14px system-ui;margin:24px}section{border:1px solid #ddd;padding:12px;margin:0 0 12px;max-width:420px}</style>
+<h1>Order intake</h1>
+<section aria-label="Customer Details">
+  <h2>Customer Details</h2>
+  <input aria-label="Customer name" value="Acme Corp">
+  <button class="x-expect">Save</button>
+</section>
+<section aria-label="Billing Details">
+  <h2>Billing Details</h2>
+  <input aria-label="Billing contact" value="A. Payer">
+  <button>Save</button>
+</section>
+<section aria-label="Address Details">
+  <h2>Address Details</h2>
+  <input aria-label="Street" value="1 Mill Lane">
+  <button>Save</button>
+</section>
+<section aria-label="Order Details">
+  <h2>Order Details</h2>
+  <input aria-label="Order reference" value="PO-771">
+  <button>Save</button>
+</section>
