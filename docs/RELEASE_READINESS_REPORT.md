@@ -1,155 +1,112 @@
-# Replayr — release readiness report
+# Replayr 0.1.0 — release readiness report
 
-Date: 2026-11-12 · Version: 0.1.0 (working tree, uncommitted) · Platform validated: Windows 11, Node 24
+Updated 2026-11-12 23:40 IST, by the release engineer, at the end of the autonomous validation phase.
 
-## Release decision: **NOT APPROVED FOR RELEASE**
+## 1. Release candidate
 
-No P0 security or data-integrity issue is open: the two found during this audit are fixed and
-tested. But **Replayr's defining workflow has not been proven against a real application.** Real
-Keycloak login, a human-driven recording, and the macOS and Linux credential backends are all
-**BLOCKED** or **NOT TESTED**:
-- No authorised test environment, account or running application was available.
-- Only a Windows machine was available.
-
-Passing tests against a sample app and a mock identity provider are not proof of real-world
-readiness. These are therefore P1 functional blockers.
-
-**Path to "APPROVED WITH DOCUMENTED LIMITATIONS":**
-1. Complete [REAL_WORLD_VALIDATION.md](REAL_WORLD_VALIDATION.md) (12 steps) on an authorised
-   non-production environment.
-2. Run the [manual recording checklist](COMPATIBILITY_REPORT.md#manual-human-recording-checklist-blocked-for-automation-needs-a-person-and-a-real-window).
-3. Either run the credential suite on macOS and Linux, or declare Windows-only support for this
-   release.
-
-If those pass, the remaining items are documented limitations, not blockers.
-
-## Test results
-
-The final complete run is `npm test`, 12 suites, each in its own process. See the
-[run summary](#final-test-run) below.
-
-| Suite | Tests | Result | What it proves |
-|---|---|---|---|
-| unit | 43 | pass | Identity engine logic |
-| targets | 18 | pass\* | Environments, kind inference, login metadata store, storage reserved names |
-| fingerprint | 45 | pass | Element identity against fixture pages |
-| positional | 46 | pass | Positional fallbacks refuse wrong elements |
-| e2e | 11 | pass | Record, change the page, replay through the identity engine |
-| replay | 13 | pass | Production → localhost against the sample app. Covers:<br>• bug present / fixed<br>• no assertion<br>• changed and ambiguous markup<br>• cancel<br>• redaction<br>• dialogs<br>• production guard<br>• API round trips |
-| security | 16 | pass | OS keyring storage (a **real** Windows Credential Manager round trip), migration, no plaintext fallback, session encryption, ACLs |
-| safety | 26 | pass | SSRF guard: redirects, metadata, private ranges, DNS classification, WebSockets, ports |
-| auth | 15 | pass | Login automation against a **mock** Keycloak: success, wrong password, MFA, expiry, isolation |
-| reliability | 10 | pass | Launch failure, crash, context loss, cancel, shutdown, hard kill, concurrency, orphans, profiles |
-| compat | 6 | pass | Canary for the private Playwright recorder API |
-| lifecycle | 10 | pass | **Machine-driven** real recordings: redaction, pause, stop, restart, cleanup |
-
-\* The first complete run had **one failure** in `targets` (`snapshot and restore`). It was a real
-intermittent Windows bug: the atomic rename over a file another process still briefly held failed
-with `EPERM`, so a user saving a login would have hit random failures. It is fixed with a bounded
-retry (`src/fsutil.js`) used by every atomic write. After the fix the suite passed 8 consecutive
-standalone runs and the confirming full run.
-
-UX regression, run separately with Playwright, not in `npm test`:
-- all 7 screens, plus test detail and 5 report states
-- 1440 / 1024 / 900 / 390 px, light and dark
-- **zero console errors**
-- keyboard, dialog focus, command palette and toasts verified
-- 2 UI bugs fixed, 5 P2 items open
-
-Supply chain: `npm audit` reports 0 vulnerabilities, there is one pinned direct dependency, and
-the lockfile is consistent. See [SECURITY_AUDIT.md §9](SECURITY_AUDIT.md#9-supply-chain--verified).
-
-## Verified vs. not
-
-| Area | Status |
+| | |
 |---|---|
-| Production → localhost replay, URL rewriting, target isolation | VERIFIED (sample app) |
-| Truthful results (passed / failed / blocked / error / cancelled / inconclusive) | VERIFIED |
-| Ambiguous elements never clicked | VERIFIED |
-| Production confirmation (HTTP 428) | VERIFIED |
-| SSRF: redirects, metadata, private networks, schemes, ports, DNS at connect time | VERIFIED (real DNS rebinding: PARTIALLY, stubbed resolver) |
-| Credentials in the OS keyring, no plaintext fallback | VERIFIED on Windows. macOS and Linux NOT TESTED. |
-| Secret redaction in recordings, storage, exports, URLs, console evidence | VERIFIED |
-| Browser process reliability and cleanup | VERIFIED on Windows. POSIX signals NOT TESTED. |
-| Private Playwright API isolated behind an adapter, with a canary test | VERIFIED |
-| Keycloak login automation | PARTIALLY VERIFIED (mock). Real Keycloak **BLOCKED**. |
-| Human-driven recording | **BLOCKED** (needs a person) |
-| Real application replay | **BLOCKED** (no authorised application or account) |
-| Firefox / WebKit, popups, iframes while recording | NOT TESTED |
+| Version | 0.1.0 (`package.json`) |
+| Branch | `release/replayr-0.1.0` (local only, never pushed, no upstream) |
+| Last commit | `c3d6f71` — *Rebrand to Replayr; add environment-aware replay, security hardening and UI redesign* |
+| Platform validated | Windows 11 Business 10.0.26300 x64 · Node v24.19.0 · Playwright 1.62.1 |
 
-## Issues by priority
+## 2. Working-tree state (uncommitted release-candidate changes, all preserved)
 
-### P0 — critical security / data integrity
+- **Modified (12):**
+  - `README.md`
+  - `docs/ENVIRONMENTS.md`, `docs/REAL_WORLD_VALIDATION.md`, `docs/RELEASE_READINESS_REPORT.md`,
+    `docs/SECURITY_AUDIT.md`
+  - `src/auth.js`, `src/config.js`, `src/recording.js`, `src/server.js`
+  - `tests/auth.test.js`, `tests/recording-lifecycle.test.js`, `tests/run-all.js`
 
-All are fixed in this audit.
+  A speculative change to `src/steps.js` was made and then fully reverted (`git diff src/steps.js`
+  is empty).
+- **New (2):** `scripts/move-credentials-to-keyring.js`, `tests/rc.test.js`.
+- **Nothing staged.** Evidence lives in `local-tests/validation-evidence/`, which is git-ignored.
+- The running server on 127.0.0.1:4310 (pid 17332, started 22:58) runs the current code. It was
+  verified idle and **not** restarted.
 
-| Issue | Status |
+## 3. Automated test results
+
+| Run | Result |
 |---|---|
-| Redirect hops bypassed Playwright request routing. A localhost replay could be redirected onto production. | **Fixed**: guard proxy plus route guard on every replay, verified with zero requests reaching the protected server |
-| No protection against cloud metadata endpoints (SSRF) | **Fixed**: blocked in replay, recording, the readiness probe, environment URLs and imports |
+| `npm test` (evidence `00-npm-test.txt`) | **269 / 270**. 1 failure, in `lifecycle`: *user closes the browser* found one extra step after the window was closed. |
+| The previous complete run, on the same code | 270 / 270 |
+| Re-investigation of the failure | Not reproduced in 4 full `lifecycle` runs under heavy CPU load or in 9 targeted probes. The suspected cause (a `closePage` action) was **disproved** and its fix reverted. The test now prints the exact steps if it recurs. **Open, intermittent (1 in 7 runs), root cause unknown.** |
+| Live security checks against a real server process (`02-live-security.txt`) | **21 / 21** |
+| Credential migration dry run (`03-credentials.txt`) | Nothing to migrate: no `credentials.local.env`, no `custom-credentials.local.json`, `.auth/` empty, 0 `.corrupt-*` files, 0 Replayr entries in Credential Manager. **No `--apply` was needed.** |
+| Supply chain | `npm audit` reports 0 vulnerabilities. One pinned dependency. |
 
-### P1 — serious functional / reliability
+## 4. R1–R10 (manual recording)
 
-| Issue | Status |
+| R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 |
+|---|---|---|---|---|---|---|---|---|---|
+| REQUIRES HUMAN | REQUIRES HUMAN | REQUIRES HUMAN | REQUIRES HUMAN | REQUIRES HUMAN | REQUIRES HUMAN | REQUIRES HUMAN | REQUIRES HUMAN | REQUIRES HUMAN | NOT RUN (automated, after R1–R9) |
+
+None has been performed. Related automated tests pass, but they are **not** counted as R results.
+See [REAL_WORLD_VALIDATION.md § Results](REAL_WORLD_VALIDATION.md).
+
+## 5. Security findings
+
+| Severity | Finding | Status |
+|---|---|---|
+| P0 | Redirect hops bypassed Playwright request routing, so a local replay could be redirected onto production | Fixed. Verified live: production received 0 requests. |
+| P0 | Cloud metadata endpoints were reachable | Fixed. Verified live: blocked as an environment URL, on import, and in the page. |
+| P1 | The local API is reachable by **other users on a shared machine** | Open. Documented limitation (single-user workstations). Token fix planned for 0.1.1. |
+| P1 | macOS and Linux keyring backends were never executed | Open. Windows-first release. |
+| P2 | Intermittent extra step after the recording window is closed (1 in 7 runs) | Open. Watched by R9. |
+| P2 | No upstream corporate proxy support, recordings contain production page text, set-aside `.corrupt-*` files | Documented |
+| — | Plaintext `ui-shell.json`, session-file collision, and recording browsers invisible to the orphan sweep | **Fixed** in the release candidate (`rc` suite) |
+
+Full detail: [SECURITY_AUDIT.md](SECURITY_AUDIT.md).
+
+## 6. Outstanding risks and platforms
+
+- **Supported:** Windows 10/11 x64, single-user workstation.
+- **Experimental:** macOS and Linux (a startup notice is printed).
+- **Not supported:** headless Linux without a keyring, and shared multi-user hosts.
+- **Biggest risk:** the identity engine and Keycloak automation have never met the real
+  application. Theme selectors, real DOM and token lifetimes are unverified.
+
+## 7. Required human actions
+
+These are the only steps that genuinely need a person:
+
+1. Provide, in chat:
+   - the QA/staging URL and the local URL;
+   - written authorisation to test that QA environment;
+   - the test account **username only**;
+   - the known bug, with the expected and actual text;
+   - the local fix branch, and how to start the local app on it.
+2. Enter the test account's password **in Replayr** (Record Bug → Advanced). Never in chat.
+3. Perform the manual recording R1–R9 and add the assertion (validation steps 3–4).
+4. During step 10, enter a deliberately wrong password in Replayr, then restore the correct one.
+
+Everything else runs autonomously once 1–3 are done:
+- steps 1, 5–9, 11 and 12;
+- R10;
+- the cookie and production-isolation checks against the real app.
+
+## 8. Evidence
+
+All evidence is in `local-tests/validation-evidence/` (git-ignored):
+
+| File | Contents |
 |---|---|
-| Real-world validation (real app, real Keycloak, human recording) not performed | **OPEN, release blocker**: BLOCKED by missing access |
-| macOS Keychain and Linux Secret Service backends never executed | **OPEN, release blocker** unless the release is declared Windows-only |
-| `.auth/ui-shell.json` session stays plaintext because an external suite shares it (ACL-restricted) | Open, documented |
-| `credentials.local.env` stays plaintext unless its values are moved into the keyring. No prompt-based helper yet. | Open, documented |
-| Intermittent `EPERM` on atomic saves (Windows) | **Fixed** |
-| Wrong password or MFA took 60 s, reported a timeout, and invited lockout | **Fixed** |
-| Cancel reported done while Chromium was still alive. Crashes went undetected. Shutdown lost run results. Launch races. | **Fixed** |
-| A missing private Playwright API silently disabled identity capture. Upgrade failures were opaque. | **Fixed** |
-| Plaintext passwords in the credential store | **Fixed** (OS keyring) |
-| Tokens in recorded URL query strings | **Fixed** (masked on record and export) |
-| Test Library stuck on a skeleton for a fresh install | **Fixed** |
+| `00-npm-test.txt` | Full test-suite output, with the commit, branch, Node version and timestamp |
+| `02-live-security.txt` | The 21 live security checks |
+| `03-credentials.txt` | Migration dry run and the credential-artifact inventory (names only) |
 
-### P2 — improvements (non-blocking)
+Procedure and results table: [REAL_WORLD_VALIDATION.md](REAL_WORLD_VALIDATION.md).
 
-- Guard proxy does not chain to an upstream corporate proxy.
-- The local API has no authentication; same-user processes can drive it.
-- Two typed URLs can collide on one session file name.
-- Cold Windows keyring calls take about 1.5–2 s.
-- Recordings contain production page text by design.
-- UX polish:
-  - one badge falls below contrast guidance (4.29:1)
-  - Test Library truncation at 1024 px
-  - a repeated "Cancelled" label
-  - focus return after the `?` dialog
-  - no offline banner
-- Pre-existing in published history: a person's name in a README example, and an internal QA
-  hostname in `src/config.js`.
+## 9. Final recommendation: **NOT APPROVED**
 
-## Git and release checklist
+Replayr has not yet been validated against a real application:
+- no QA environment, account or human tester has been provided;
+- R1–R10 are not done;
+- one intermittent automated failure is open (P2).
 
-- [x] Backup of the pre-sprint work verified to exist (scratchpad `pre-sprint/`: `wip.diff`,
-      `targets.js`, `targets.test.js`).
-- [x] Change set reviewed: 19 modified, 1 deleted (`ui/app.js`, split into `ui/*.js` with no lines
-      lost), 36 new files. Nothing committed or pushed.
-- [x] No secrets, credentials, tokens or personal data in any changed or new file.
-- [x] No generated artefacts. `local-tests/`, `.auth/`, `*.local.env` and `*.local.json` are
-      git-ignored. Run evidence, browser-profile ledgers and drafts live in `local-tests/`.
-- [x] One binary, intentionally vendored: `ui/fonts/inter-var-latin.woff2` (48 KB), with its OFL
-      licence.
-- [x] `npm audit` clean, Playwright pinned, lockfile consistent.
-- [ ] Real-world validation ([REAL_WORLD_VALIDATION.md](REAL_WORLD_VALIDATION.md)).
-- [ ] Manual human recording checklist.
-- [ ] macOS / Linux keyring check, or a Windows-only declaration.
-- [ ] Decide whether to scrub the pre-existing person's name and internal hostname. They are
-      already in published history, so a scrub would need a history rewrite and is out of scope.
-- [ ] Commit (awaiting approval), tag `v0.1.0` only after the blockers above are cleared.
-
-## Final test run
-
-This is the confirming complete run, after the `EPERM` fix, on Windows 11 with Node 24 and
-headless Chromium:
-
-```
-unit 43 · targets 18 · fingerprint 45 · positional 46 · e2e 11 · replay 13 · security 16
-safety 26 · auth 15 · reliability 10 · compat 6 · lifecycle 10
-TOTAL 259 passed, 0 failed of 259   (248 s)
-```
-
-The previous complete run was 258/259; its one failure is the `EPERM` bug described above. No test
-was skipped, weakened or retried to obtain this result. The bounded retry is in product code
-(`src/fsutil.js`), not in the tests.
+When steps 1–12 and R1–R10 pass, and the intermittent failure is either explained or shown not
+to occur in R9, the recommendation can move to **APPROVED** for Windows single-user workstations,
+with the documented limitations.

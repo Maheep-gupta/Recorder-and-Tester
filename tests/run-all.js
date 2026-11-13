@@ -30,6 +30,7 @@ const FILES = [
   { label: 'reliability', file: 'reliability.test.js', what: 'Chromium - launch failure, crash, cancel, shutdown, concurrency, orphans' },
   { label: 'compat', file: 'compat.test.js', what: 'Chromium - private Playwright recorder API canary' },
   { label: 'lifecycle', file: 'recording-lifecycle.test.js', what: 'Chromium - machine-driven real recording lifecycle and cleanup' },
+  { label: 'rc', file: 'rc.test.js', what: 'release fixes - session isolation, ui-shell encryption, credential migration' },
 ];
 
 /** Run one test file, echoing its output live, and read the summary line back out of it. */

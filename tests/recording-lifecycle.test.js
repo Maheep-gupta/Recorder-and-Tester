@@ -340,10 +340,12 @@ test('[machine-driven real recording] user closes the browser: recording finishe
     await rec.activePage.fill('#nm', 'before close');
     await until(() => ['click', 'fill'].every((t) => typesOf(rec).includes(t)), 8000, 'steps');
     const n = rec.state.steps.length;
+    const describeSteps = () => rec.state.steps.map((s) => s.type + (s.recordedIdle ? '(idle)' : '') + (s.addedByHand ? '(hand)' : '')).join(', ');
+    const beforeClose = describeSteps();
     await refreshPids(l);
     await l.browser.close();                                 // what clicking the window's X does
     await until(() => rec.state.status === 'stopped', 8000, 'status to become stopped');
-    assert.equal(rec.state.steps.length, n, 'steps kept');
+    assert.equal(rec.state.steps.length, n, `steps kept (before close: ${beforeClose} | after: ${describeSteps()})`);
     assert.ok(rec.state.stoppedAt);
     assert.equal(rec.browser, null);
     assert.equal(rec.active, false);

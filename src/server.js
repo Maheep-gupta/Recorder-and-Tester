@@ -725,6 +725,9 @@ server.listen(PORT, config.host, () => {
     const c = require('./pw-compat').checkCompat();
     log(`playwright ${c.version}: ${c.ok ? 'compatible' : 'INCOMPATIBLE ' + (c.missing || []).join(', ')}${c.tested ? '' : ' (untested version — recording may fail; see docs/COMPATIBILITY_REPORT.md)'}`);
   } catch (e) { log(`playwright compatibility check failed: ${e.message}`); }
+  if (process.platform !== 'win32') {
+    log(`NOTE: ${process.platform} is EXPERIMENTAL in this release — the OS keyring backend and browser cleanup are verified on Windows only. See docs/RELEASE_READINESS_REPORT.md.`);
+  }
   log(`tests: ${storage.TESTS}`);
   for (const [key, def] of Object.entries(config.apps)) log(`app ${key}: ${def.baseUrl}${def.auth ? ' (login required)' : ''}`);
   if (!auth.hasSavedState()) log('NOTE: no saved login yet — the first recording will log in with credentials.local.env');

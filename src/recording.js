@@ -513,7 +513,11 @@ class Recording extends EventEmitter {
       // Chrome switch, and a maximised window would silently override the size the form chose.
       const maximise = headed && !wantViewport && engineKey === 'chromium';
       try {
-        launched = await engine.launch({ headless: !headed, args: maximise ? ['--start-maximized'] : [] });
+        // Chromium recordings carry the same owner marker as replays, so the boot-time orphan sweep
+        // and the release cleanup check also see a recording browser left behind by a hard stop.
+        const args = maximise ? ['--start-maximized'] : [];
+        if (engineKey === 'chromium') args.push(`--replayr-owner=${process.pid}`);
+        launched = await engine.launch({ headless: !headed, args });
       } catch (e) {
         if (/executable doesn't exist|please run the following command/i.test(String(e.message))) {
           throw Object.assign(new Error(

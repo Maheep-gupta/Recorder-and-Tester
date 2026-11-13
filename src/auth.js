@@ -46,8 +46,33 @@ function hasSavedState(app = config.defaultApp) {
 const SESSION_KEY_ACCOUNT = 'session-key';
 const ENC_MARK = 'replayr-enc-v1';
 
+/**
+ * `.auth/ui-shell.json` used to be shared with an external Playwright suite, so it was kept as plain
+ * Playwright JSON. Since Replayr moved out of that suite's repository the file lives in Replayr's own
+ * `.auth/` and nothing else reads it, so it is encrypted like every other session. A team that really
+ * does share the file can keep the old behaviour with REPLAYR_SHARE_UI_SHELL_SESSION=1 (plaintext,
+ * user-only ACL).
+ */
 function isSharedPlainSession(app) {
-  return config.authStateFor(app) === config.authStatePath;
+  return /^(1|true|yes|on)$/i.test(String(process.env.REPLAYR_SHARE_UI_SHELL_SESSION || ''))
+    && config.authStateFor(app) === config.authStatePath;
+}
+
+/** Encrypt a legacy plaintext session file in place (atomic). Best effort: on failure it stays as it was. */
+function migratePlainSession(file, app) {
+  if (!secretstore.available().ok) return false;
+  try {
+    const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, encryptState(state), { encoding: 'utf8', mode: 0o600 });
+    secretstore.restrictFile(tmp);
+    renameSyncRetry(tmp, file);
+    console.warn(`[replayr] the saved session for ${app} was plaintext; it is now encrypted`);
+    return true;
+  } catch (e) {
+    console.warn(`[replayr] WARNING: could not encrypt the plaintext session for ${app} (${e.message}); it is still plaintext`);
+    return false;
+  }
 }
 
 function sessionKey(create) {
@@ -89,7 +114,9 @@ function storageStateOption(app) {
       return {};
     }
   }
-  return { storageState: file };
+  // A plaintext session written by an older Replayr: use it, and encrypt it in place.
+  if (doc && typeof doc === 'object' && !isSharedPlainSession(app)) migratePlainSession(file, app);
+  return { storageState: doc && typeof doc === 'object' ? doc : file };
 }
 
 /**
@@ -328,7 +355,7 @@ function warnPlaintextEnvFile() {
   if (!names.length) return;
   console.warn(`[replayr] WARNING: ${path.basename(config.credentialsPath)} holds ${names.length} plaintext OPKEY_* value(s) (${names.join(', ')}). ` +
     'Prefer the OS credential store: save each value under the account env:<NAME> (service "Replayr"), e.g. env:OPKEY_PASSWORD; ' +
-    'those take priority over this file. See docs for the one-line command per OS.');
+    'those take priority over this file. Run "node scripts/move-credentials-to-keyring.js" to move them (dry run first; --apply to do it).');
 }
 warnPlaintextEnvFile();
 

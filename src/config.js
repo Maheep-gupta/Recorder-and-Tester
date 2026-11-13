@@ -99,10 +99,17 @@ module.exports = {
    * Playwright suite owns that file too. Pointing a second environment at it would mean each
    * login rewrote the other's file, and a remote QA session landing in the suite's state is the
    * kind of surprise that costs an afternoon. One environment, one file.
+   *
+   * Keys that are not already filename-safe (typed `url:` keys) get a short hash of the FULL key
+   * appended: sanitising alone mapped `url:http://a.b` and `url:http://a_b` to the same file, so two
+   * environments could share one session. Configured and user keys are unchanged.
    */
   authStateFor(app) {
     if (app === 'ui-shell') return this.authStatePath;
-    return path.join(SUITE, '.auth', String(app).replace(/[^a-z0-9_-]/gi, '_') + '.json');
+    const key = String(app);
+    if (/^[a-z0-9_-]+$/i.test(key)) return path.join(SUITE, '.auth', key + '.json');
+    const hash = require('crypto').createHash('sha256').update(key).digest('hex').slice(0, 12);
+    return path.join(SUITE, '.auth', key.replace(/[^a-z0-9_-]/gi, '_').slice(0, 80) + '-' + hash + '.json');
   },
 
   /**

@@ -144,7 +144,8 @@ local-tests/          your tests, environments and run evidence (git-ignored, cr
 | `recorder.local.env` | Optional configuration overrides (git-ignored). |
 | `custom-credentials.local.json` | Which origins have a saved login (username and date only). **Passwords live in the OS keyring:** Windows Credential Manager, macOS Keychain or Linux Secret Service. With no keyring, saving is refused unless you set `REPLAYR_ALLOW_PLAINTEXT_CREDENTIALS=1`. |
 | `credentials.local.env` | Optional `OPKEY_*` logins for the built-in apps. This file is **plaintext**, so prefer keyring accounts `env:OPKEY_*`, which take precedence. See [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md). |
-| `.auth/<env>.json` | Saved login sessions, encrypted with a key held in the OS keyring. The exception is `.auth/ui-shell.json`, which is shared with an external suite: it stays plaintext and is restricted to your user. |
+| `.auth/<env>.json` | Saved login sessions, encrypted with a key held in the OS keyring (older plaintext files are encrypted in place on first use). `REPLAYR_SHARE_UI_SHELL_SESSION=1` keeps `.auth/ui-shell.json` plain for a team that shares it with another tool. |
+| `scripts/move-credentials-to-keyring.js` | Moves the `OPKEY_*` values from `credentials.local.env` into the OS keyring. Run it without arguments for a dry run, then with `--apply`. |
 
 ### Deleting a test does not delete it
 

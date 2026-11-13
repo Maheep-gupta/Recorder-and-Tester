@@ -52,7 +52,7 @@ URLs on other hosts (a third-party payment page, an SSO host) are left alone.
   for typed URLs). Passwords typed in Replayr live in the OS keyring (Windows Credential
   Manager, macOS Keychain, Linux Secret Service) and sessions are encrypted with a key held there.
   With no keyring, saving a login is refused rather than written in plaintext.
-  `credentials.local.env` and the shared `.auth/ui-shell.json` remain plaintext, so treat the
+  `credentials.local.env` stays plaintext until you run `node scripts/move-credentials-to-keyring.js --apply`, so treat the
   folder as sensitive (see [SECURITY_AUDIT.md](SECURITY_AUDIT.md)).
 - A production session or password is **never** used for another environment, never written
   into a test, and never included in an export.

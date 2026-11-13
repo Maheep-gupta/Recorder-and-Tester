@@ -166,7 +166,8 @@ test('1  successful login: renewed, state written for THAT environment only, hol
     assert.equal(res.status, 'renewed', `unexpected status: ${res.status} / ${res.message}`);
     assert.ok(fs.existsSync(stateFile(app)), 'state file written');
     // Other scenarios run concurrently in the same dir, so assert on this key's file, not a dir diff.
-    assert.match(path.basename(stateFile(app)), /^url_http___127_0_0_1_\d+\.json$/, 'file is named for this environment key');
+    // Typed `url:` keys carry a hash of the full key so two URLs never share a session file.
+    assert.match(path.basename(stateFile(app)), /^url_http___127_0_0_1_\d+-[0-9a-f]{12}\.json$/, 'file is named for this environment key');
     const st = readState(app);
     const c = st.cookies.find((x) => x.name === 'APP_SESSION');
     assert.ok(c && c.value, 'session cookie persisted in the state file');
